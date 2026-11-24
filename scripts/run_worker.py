@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 
 TEST_BUILD_RE = re.compile(
@@ -24,7 +25,9 @@ TEST_BUILD_RE = re.compile(
     r"swift\s+(?:build|test)|xcodebuild|tsc\b|run-tests|just\s+(?:t|l|test|check)|make\s+(?:test|check|build))\b"
 )
 PROGRESS_HINT = "工具调用之间的过渡进度说明必须使用一句简短中文（不带 Markdown 标题或列表）；最终报告语言按用户任务要求。"
-RULE_LINE = "─" * 44
+CARD_WIDTH = 54
+RULE_LINE = "─" * CARD_WIDTH
+TOKEN_RE = re.compile(r"[A-Za-z0-9_./:@+-]+| +|[^A-Za-z0-9_./:@+-]")
 
 BACKENDS = ("codex", "claude", "qoder", "kimi", "devin")
 TITLES = {"codex": "Codex", "claude": "Claude", "qoder": "Qoder", "kimi": "Kimi", "devin": "Devin"}
@@ -83,18 +86,114 @@ def short_path(p: str, root: str) -> str:
     return "/".join(parts[-3:])
 
 
+def char_width(ch: str) -> int:
+    if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    cp = ord(ch)
+    if cp >= 0x1F300 or (0x2600 <= cp <= 0x27BF) or (0x2300 <= cp <= 0x23FF):
+        return 2
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def disp_width(text: str) -> int:
+    return sum(char_width(c) for c in text)
+
+
+def _split_long_token(tok: str, max_w: int) -> list[str]:
+    out: list[str] = []
+    cur: list[str] = []
+    w = 0
+    for ch in tok:
+        cw = char_width(ch)
+        if cur and w + cw > max_w:
+            out.append("".join(cur))
+            cur = [ch]
+            w = cw
+        else:
+            cur.append(ch)
+            w += cw
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def wrap_display_lines(text: str, max_w: int) -> list[str]:
+    out: list[str] = []
+    for para in text.splitlines():
+        para = para.strip()
+        if not para:
+            continue
+        cur = ""
+        cur_w = 0
+        for tok in TOKEN_RE.findall(para):
+            if tok.isspace():
+                if cur and cur_w + 1 <= max_w:
+                    cur += " "
+                    cur_w += 1
+                continue
+            tw = disp_width(tok)
+            if tw > max_w:
+                if cur.rstrip():
+                    out.append(cur.rstrip())
+                    cur, cur_w = "", 0
+                pieces = _split_long_token(tok, max_w)
+                out.extend(pieces[:-1])
+                cur = pieces[-1]
+                cur_w = disp_width(cur)
+            elif cur and cur_w + tw > max_w:
+                out.append(cur.rstrip())
+                cur = tok
+                cur_w = tw
+            else:
+                cur += tok
+                cur_w += tw
+        if cur.rstrip():
+            out.append(cur.rstrip())
+    return out
+
+
 def clean_progress_text(text: str) -> str:
     cleaned = text.strip()
     if not cleaned:
         return ""
+    cleaned = cleaned.replace("…", "...")
     cleaned = re.sub(r"`([^`\n]+)`", r"\1", cleaned)
     cleaned = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", cleaned)
     lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def format_block_with_time(icon: str, text: str, ts: str, width: int = CARD_WIDTH) -> str:
+    prefix_first = f"{icon} "
+    prefix_w = disp_width(prefix_first)
+    indent = " " * prefix_w
+    body_w = max(20, width - prefix_w)
+    ts_slot = disp_width(ts) + 2  # at least 2 spaces before right-aligned timestamp
+    last_max = max(12, body_w - ts_slot)
+
+    lines = wrap_display_lines(text, body_w)
     if not lines:
-        return ""
+        lines = [""]
     if len(lines) > 4:
-        lines = lines[:3] + ["…"]
-    return "\n         ".join(lines)
+        lines = lines[:3] + [lines[3][: max(1, len(lines[3]) - 3)].rstrip() + "..."]
+
+    # If the final line is too wide to fit the timestamp on the same line, split it cleanly so
+    # the tail words land on the next line with the timestamp at the bottom-right corner.
+    if disp_width(lines[-1]) > last_max:
+        tail_split = wrap_display_lines(lines[-1], last_max)
+        lines = lines[:-1] + tail_split
+
+    rendered: list[str] = []
+    for idx, ln in enumerate(lines):
+        pfx = prefix_first if idx == 0 else indent
+        if idx == len(lines) - 1:
+            pad = max(2, body_w - disp_width(ln) - disp_width(ts))
+            rendered.append(f"{pfx}{ln}{' ' * pad}{ts}")
+        else:
+            rendered.append(f"{pfx}{ln}")
+    return "\n".join(rendered)
 
 
 def content_text(content) -> str:
@@ -180,33 +279,41 @@ class UI:
         self.last_print = self.t0
         self.has_body = False
         self.need_gap = True
+        self.last_sub = None
 
     def note(self, msg: str) -> None:
         if self.need_gap:
             safe_print("")
-        self.last_print = safe_print(f"{self.elapsed()}  💬 {msg}")
+        self.last_print = safe_print(format_block_with_time("💬", msg, self.elapsed()))
         self.has_body = True
         self.need_gap = False
+        self.last_sub = None
 
     def sub(self, icon: str, msg: str) -> None:
+        clean_msg = msg.replace("…", "...")
+        if self.last_sub == (icon, clean_msg):
+            return
+        self.last_sub = (icon, clean_msg)
         if not self.has_body:
             safe_print("")
-            self.last_print = safe_print(f"{self.elapsed()}  {icon} {msg}")
+            self.last_print = safe_print(format_block_with_time(icon, clean_msg, self.elapsed()))
         else:
-            self.last_print = safe_print(f"       {icon} {msg}")
+            self.last_print = safe_print(f"   {icon} {clean_msg}")
         self.has_body = True
         self.need_gap = True
 
     def status(self, icon: str, msg: str) -> None:
+        clean_msg = msg.replace("…", "...")
         if not self.has_body:
             safe_print("")
-        self.last_print = safe_print(f"{self.elapsed()}  {icon} {msg}")
+        self.last_print = safe_print(format_block_with_time(icon, clean_msg, self.elapsed()))
         self.has_body = True
         self.need_gap = True
+        self.last_sub = None
 
     def heartbeat(self, seconds: int, steps: int) -> None:
         if seconds > 0 and (time.monotonic() - self.last_print) >= seconds:
-            self.status("⏳", f"思考/执行中 ({steps} 步)…")
+            self.status("⏳", f"思考/执行中 ({steps} 步)...")
 
     def elapsed(self) -> str:
         return fmt_elapsed(self.t0)
@@ -1237,9 +1344,10 @@ def main() -> int:
     safe_print("")
     safe_print(RULE_LINE)
     if rc == 0:
-        safe_print(f"✅ 完成 · 用时 {ui.elapsed()} · {steps} 步{cost}")
+        safe_print(format_block_with_time("✅", f"完成 · {steps} 步{cost}", ui.elapsed()))
     else:
-        safe_print(f"❌ 失败 (exit {rc}) · 用时 {ui.elapsed()} · 日志: {ctx.stderr_file}")
+        safe_print(format_block_with_time("❌", f"失败 (exit {rc}) · {steps} 步", ui.elapsed()))
+        safe_print(f"   日志: {ctx.stderr_file}")
     return rc
 
 

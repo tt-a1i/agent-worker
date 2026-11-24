@@ -847,6 +847,29 @@ print(json.dumps({"type": "turn.completed"}))
         self.assertIn("Reconnecting", proc.stdout)
         self.assertEqual(self.read(outdir, "out.md").strip(), "recovered report")
 
+    def test_bottom_right_timestamp_wrapping_and_dedup(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rw", str(SCRIPT))
+        rw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rw)
+
+        short_blk = rw.format_block_with_time("💬", "我先检查这两个文件的内容。", "00:02")
+        self.assertEqual(len(short_blk.splitlines()), 1)
+        self.assertTrue(short_blk.endswith("00:02"))
+        self.assertEqual(rw.disp_width(short_blk), rw.CARD_WIDTH)
+
+        long_blk = rw.format_block_with_time(
+            "💬",
+            "已定位问题：mul 返回的是和而不是积，现在重写 run_worker.py 并补充边界测试。",
+            "01:14",
+        )
+        lines = long_blk.splitlines()
+        self.assertGreaterEqual(len(lines), 2)
+        self.assertFalse(lines[0].endswith("01:14"))
+        self.assertTrue(lines[-1].endswith("01:14"))
+        self.assertEqual(rw.disp_width(lines[-1]), rw.CARD_WIDTH)
+        self.assertIn("run_worker.py", long_blk)
+
 
 if __name__ == "__main__":
     unittest.main()
