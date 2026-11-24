@@ -163,10 +163,13 @@ EOF
 | `exit` | 最终退出码 |
 | `.prompt.*` | 超长 Kimi / Devin 临时提示词（权限 `0600`，运行结束自动删除） |
 
-## 环境变量
+## 环境变量与本地配置
 
-| 变量 | 作用 |
+| 变量 / 配置 | 作用 |
 | --- | --- |
+| `~/.config/agent-worker/config.json` | 可选本地配置，如 `{"allowed_backends": ["codex", "qoder"]}` 用于限制本机允许调用的后端 |
+| `AGENT_WORKER_ALLOWED` | 逗号分隔的后端白名单（如 `codex,qoder`，传 `*` 放行全部），优先级高于配置文件 |
+| `AGENT_WORKER_CONFIG` | 覆盖配置文件路径（传空字符串可跳过读取默认配置） |
 | `AGENT_WORKER_<BACKEND>_BIN` | 覆盖后端可执行文件路径，如 `AGENT_WORKER_CODEX_BIN` |
 | `AGENT_WORKER_DEVIN_DB` | 覆盖 Devin 会话数据库路径（默认 `~/.local/share/devin/cli/sessions.db`） |
 

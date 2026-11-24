@@ -70,6 +70,8 @@ class WorkerTests(unittest.TestCase):
     def env_for(self, backend, mock, env_extra=None):
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
+        env["AGENT_WORKER_CONFIG"] = ""
+        env.pop("AGENT_WORKER_ALLOWED", None)
         env[f"CLI_WORKER_{backend.upper()}_BIN"] = str(mock)
         if env_extra:
             env.update(env_extra)
@@ -97,6 +99,10 @@ class WorkerTests(unittest.TestCase):
         return proc, outdir_path
 
     def run_argv(self, argv, *, stdin_text="", env=None, cwd=None, timeout=90):
+        if env is None:
+            env = os.environ.copy()
+            env["AGENT_WORKER_CONFIG"] = ""
+            env.pop("AGENT_WORKER_ALLOWED", None)
         return subprocess.run(
             [sys.executable, str(SCRIPT), *argv],
             input=stdin_text,
@@ -869,6 +875,54 @@ print(json.dumps({"type": "turn.completed"}))
         self.assertTrue(lines[-1].endswith("01:14"))
         self.assertEqual(rw.disp_width(lines[-1]), rw.CARD_WIDTH)
         self.assertIn("run_worker.py", long_blk)
+
+    def test_allowed_backends_config_and_env_override(self):
+        cfg = self.dir / "config.json"
+        cfg.write_text(json.dumps({"allowed_backends": ["codex", "qoder"]}), encoding="utf-8")
+        mock_claude = self.write_mock(
+            "claude",
+            """
+            print(json.dumps({"type": "result", "session_id": "s1", "is_error": False, "result": "claude ok"}), flush=True)
+            """,
+        )
+        mock_qoder = self.write_mock(
+            "qoder",
+            """
+            print(json.dumps({"type": "result", "session_id": "s2", "is_error": False, "result": "qoder ok"}), flush=True)
+            """,
+        )
+
+        # Blocked by config.json
+        proc_blocked, _ = self.run_cli(
+            "claude", mock_claude, prompt="hi", env_extra={"AGENT_WORKER_CONFIG": str(cfg)}
+        )
+        self.assertEqual(proc_blocked.returncode, 2)
+        self.assertIn("backend 'claude' is disabled", proc_blocked.stderr)
+        self.assertIn("codex, qoder", proc_blocked.stderr)
+
+        # Allowed by config.json
+        proc_ok, out_ok = self.run_cli(
+            "qoder", mock_qoder, prompt="hi", env_extra={"AGENT_WORKER_CONFIG": str(cfg)}
+        )
+        self.assertEqual(proc_ok.returncode, 0, proc_ok.stderr)
+        self.assertEqual(self.read(out_ok, "out.md"), "qoder ok")
+
+        # AGENT_WORKER_ALLOWED=* overrides restrictive config.json
+        proc_override, out_override = self.run_cli(
+            "claude",
+            mock_claude,
+            prompt="hi",
+            env_extra={"AGENT_WORKER_CONFIG": str(cfg), "AGENT_WORKER_ALLOWED": "*"},
+        )
+        self.assertEqual(proc_override.returncode, 0, proc_override.stderr)
+        self.assertEqual(self.read(out_override, "out.md"), "claude ok")
+
+        # AGENT_WORKER_ALLOWED restricts directly without config.json
+        proc_env_block, _ = self.run_cli(
+            "claude", mock_claude, prompt="hi", env_extra={"AGENT_WORKER_ALLOWED": "qoder"}
+        )
+        self.assertEqual(proc_env_block.returncode, 2)
+        self.assertIn("disabled by AGENT_WORKER_ALLOWED", proc_env_block.stderr)
 
 
 if __name__ == "__main__":

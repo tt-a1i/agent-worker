@@ -163,10 +163,13 @@ EOF
 | `exit` | Final exit code |
 | `.prompt.*` | Oversized Kimi / Devin prompt files (mode `0600`, removed when the run ends) |
 
-## Environment variables
+## Environment variables and local config
 
-| Variable | Purpose |
+| Variable / Config | Purpose |
 | --- | --- |
+| `~/.config/agent-worker/config.json` | Optional local config, e.g. `{"allowed_backends": ["codex", "qoder"]}` to restrict enabled backends on a machine |
+| `AGENT_WORKER_ALLOWED` | Comma-separated backend allowlist (e.g. `codex,qoder`, or `*` for all); overrides the config file |
+| `AGENT_WORKER_CONFIG` | Override the config file path (set to empty string `""` to skip loading the default config) |
 | `AGENT_WORKER_<BACKEND>_BIN` | Override the backend executable path, e.g. `AGENT_WORKER_CODEX_BIN` |
 | `AGENT_WORKER_DEVIN_DB` | Override the Devin session database path (default `~/.local/share/devin/cli/sessions.db`) |
 

@@ -17,7 +17,7 @@ description: >-
 - **When to delegate vs. edit directly**:
   - **Delegate** iterative edit-test-fix loops, multi-file changes/refactors, or independent plan/diff review.
   - **Edit directly in the host**—even when acting as an "orchestrator" or following up on a Worker-authored PR/branch (unless the user explicitly forbids host edits)—when target lines and fix are already clear (5–10 line tweaks, constants/thresholds/copy, small review nits, or running one known command).
-- **Avoid self-delegation**: default to a *different* CLI than the current host unless the user explicitly asks for a fresh isolated worker of the same CLI.
+- **Avoid self-delegation**: default to a *different* CLI than the current host unless the user explicitly asks for a fresh isolated worker of the same CLI (if `~/.config/agent-worker/config.json` restricts `allowed_backends`, pick from those).
 - **Backend defaults & launch policy** (routine → review):
   - `codex`: `-m` omitted → Codex's built-in default model (`-e medium` routine; `-e high` for review, or pass `-m <flagship>` for hard architecture/high-stakes review). Keep `service_tier=default`—never offer/use `fast`/`ultrafast` unless the user explicitly asks.
   - `claude`: routine `sonnet` (`-e medium`); review `opus` (`-e high`).

@@ -52,6 +52,7 @@ DRAIN_DEADLINE = 0.5
 KIMI_FORK_TIMEOUT = 30.0
 KIMI_PROMPT_FILE_THRESHOLD = 96_000
 DEVIN_POLL_INTERVAL = 1.0
+DEFAULT_CONFIG_PATH = "~/.config/agent-worker/config.json"
 
 
 def fmt_elapsed(t0: float) -> str:
@@ -1246,9 +1247,57 @@ def read_stdin_nonblocking() -> str:
     return ""
 
 
+def check_allowed_backend(ap: argparse.ArgumentParser, backend: str) -> None:
+    env_allowed = os.environ.get("AGENT_WORKER_ALLOWED", "").strip()
+    if env_allowed:
+        if env_allowed in ("*", "all"):
+            return
+        allowed = [b.strip() for b in env_allowed.split(",") if b.strip()]
+        unknown = [b for b in allowed if b not in BACKENDS]
+        if unknown:
+            ap.error(f"invalid backend(s) in AGENT_WORKER_ALLOWED: {', '.join(unknown)}")
+        if backend not in allowed:
+            ap.error(
+                f"backend '{backend}' is disabled by AGENT_WORKER_ALLOWED "
+                f"(allowed: {', '.join(allowed) or 'none'})"
+            )
+        return
+
+    cfg_raw = os.environ.get("AGENT_WORKER_CONFIG")
+    if cfg_raw == "":
+        return
+    cfg_path = pathlib.Path(cfg_raw or DEFAULT_CONFIG_PATH).expanduser()
+    if not cfg_path.exists():
+        return
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        ap.error(f"failed to read config {cfg_path}: {exc}")
+        return
+    if not isinstance(data, dict):
+        ap.error(f"config {cfg_path} must be a JSON object")
+        return
+    if "allowed_backends" not in data:
+        return
+    raw_list = data["allowed_backends"]
+    if not isinstance(raw_list, list) or not all(isinstance(x, str) for x in raw_list):
+        ap.error(f"allowed_backends in {cfg_path} must be a list of backend names")
+        return
+    allowed = [b.strip() for b in raw_list if b.strip()]
+    unknown = [b for b in allowed if b not in BACKENDS]
+    if unknown:
+        ap.error(f"invalid backend(s) in {cfg_path} allowed_backends: {', '.join(unknown)}")
+    if backend not in allowed:
+        ap.error(
+            f"backend '{backend}' is disabled by {cfg_path} "
+            f"(allowed_backends: {', '.join(allowed) or 'none'})"
+        )
+
+
 def main() -> int:
     ap = build_parser()
     args = ap.parse_intermixed_args()
+    check_allowed_backend(ap, args.backend)
 
     if args.resume is not None and not args.resume.strip():
         ap.error("--resume requires a non-empty session ID")
