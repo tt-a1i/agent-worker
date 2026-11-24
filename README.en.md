@@ -1,5 +1,7 @@
 <div align="center">
 
+<p align="center"><img src="assets/cover.png" alt="agent-worker cover" width="640"></p>
+
 # agent-worker
 
 **Let any host AI agent (Claude Code, Codex, Antigravity, Cursor, etc.) orchestrate local `codex`, `claude`, `qoder`, `kimi`, and `devin` CLIs as disciplined background workers and cross-model reviewers.**
@@ -187,6 +189,8 @@ Tests use temporary mock executables and a temporary SQLite database; no real mo
 ```text
 agent-worker/
 ├── SKILL.md                 # Skill instructions for host agents
+├── assets/
+│   └── cover.png            # README cover (from LiuShengyu-Tech/chatgpt-desktop-mcp, MIT)
 ├── scripts/
 │   └── run_worker.py        # Unified runner (stdlib only)
 ├── tests/
@@ -200,3 +204,5 @@ agent-worker/
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+Cover image `assets/cover.png` is from [LiuShengyu-Tech/chatgpt-desktop-mcp](https://github.com/LiuShengyu-Tech/chatgpt-desktop-mcp) (MIT).

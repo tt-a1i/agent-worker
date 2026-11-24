@@ -1,5 +1,7 @@
 <div align="center">
 
+<p align="center"><img src="assets/cover.png" alt="agent-worker cover" width="640"></p>
+
 # agent-worker
 
 **让任意宿主 AI Agent（Claude Code、Codex、Antigravity、Cursor 等）统一调度本机 `codex` / `claude` / `qoder` / `kimi` / `devin` 作为受控后台 Worker 与交叉审查员。**
@@ -187,6 +189,8 @@ python3 -m py_compile scripts/run_worker.py
 ```text
 agent-worker/
 ├── SKILL.md                 # 技能说明（供主机 Agent 阅读）
+├── assets/
+│   └── cover.png            # README 封面（来自 LiuShengyu-Tech/chatgpt-desktop-mcp，MIT）
 ├── scripts/
 │   └── run_worker.py        # 统一执行器（仅标准库）
 ├── tests/
@@ -200,3 +204,5 @@ agent-worker/
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
+
+封面图片 `assets/cover.png` 来自 [LiuShengyu-Tech/chatgpt-desktop-mcp](https://github.com/LiuShengyu-Tech/chatgpt-desktop-mcp)（MIT）。
