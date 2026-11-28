@@ -2,6 +2,9 @@
 """Tests for the unified worker runner using mock CLI executables and a temporary Devin SQLite DB."""
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -13,6 +16,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "run_worker.py"
@@ -164,11 +168,13 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read(outdir, "out.md"), "Final report body")
         self.assertEqual(self.read(outdir, "sid").strip(), "th-123")
-        self.assertIn("🚀 Codex · default (medium)", proc.stdout)
-        self.assertIn("✏️ a.py", proc.stdout)
-        self.assertIn("🧪", proc.stdout)
-        self.assertIn("✅ 完成", proc.stdout)
-        self.assertIn("2 步", proc.stdout)
+        header, top, first, sub, bottom, summary = proc.stdout.splitlines()
+        self.assertEqual(header, "🚀 Codex · default (medium) · repo")
+        self.assertEqual(top, "─" * 50)
+        self.assertRegex(first, r"^[0-9]{2}:[0-9]{2} │ 🧪 运行测试/检查中\.\.\.$")
+        self.assertEqual(sub, "      │ ✏️ a.py")
+        self.assertEqual(bottom, top)
+        self.assertRegex(summary, r"^[0-9]{2}:[0-9]{2} │ ✅ 完成 · 2 步$")
         argv = json.loads(argv_file.read_text())
         self.assertIn("--ignore-user-config", argv)
         self.assertIn("model_reasoning_effort=medium", argv)
@@ -223,8 +229,20 @@ class WorkerTests(unittest.TestCase):
         proc, outdir = self.run_cli("codex", mock, "--heartbeat", "0", prompt="do it")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read(outdir, "out.md"), "FINAL ANSWER")
-        self.assertNotIn("FINAL ANSWER", proc.stdout)
-        self.assertNotIn("💬", proc.stdout)
+        header, rule, summary = proc.stdout.splitlines()
+        self.assertEqual(header, "🚀 Codex · default (medium) · repo")
+        self.assertEqual(rule, "─" * 50)
+        self.assertRegex(summary, r"^[0-9]{2}:[0-9]{2} │ ✅ 完成 · 0 步$")
+
+    def test_codex_failure_without_progress_has_one_rule(self):
+        mock = self.write_mock("codex", "sys.exit(3)\n")
+        proc, outdir = self.run_cli("codex", mock, "--heartbeat", "0", prompt="do it")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        header, rule, summary, log = proc.stdout.splitlines()
+        self.assertEqual(header, "🚀 Codex · default (medium) · repo")
+        self.assertEqual(rule, "─" * 50)
+        self.assertRegex(summary, r"^[0-9]{2}:[0-9]{2} │ ❌ 失败 \(exit 3\) · 0 步$")
+        self.assertEqual(log, f"      │    日志: {outdir / 'stderr.log'}")
 
     def test_codex_stale_out_dir_is_not_reused(self):
         outdir = self.path("reused")
@@ -853,29 +871,6 @@ print(json.dumps({"type": "turn.completed"}))
         self.assertIn("Reconnecting", proc.stdout)
         self.assertEqual(self.read(outdir, "out.md").strip(), "recovered report")
 
-    def test_bottom_right_timestamp_wrapping_and_dedup(self):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("rw", str(SCRIPT))
-        rw = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rw)
-
-        short_blk = rw.format_block_with_time("💬", "我先检查这两个文件的内容。", "00:02")
-        self.assertEqual(len(short_blk.splitlines()), 1)
-        self.assertTrue(short_blk.endswith("00:02"))
-        self.assertEqual(rw.disp_width(short_blk), rw.CARD_WIDTH)
-
-        long_blk = rw.format_block_with_time(
-            "💬",
-            "已定位问题：mul 返回的是和而不是积，现在重写 run_worker.py 并补充边界测试。",
-            "01:14",
-        )
-        lines = long_blk.splitlines()
-        self.assertGreaterEqual(len(lines), 2)
-        self.assertFalse(lines[0].endswith("01:14"))
-        self.assertTrue(lines[-1].endswith("01:14"))
-        self.assertEqual(rw.disp_width(lines[-1]), rw.CARD_WIDTH)
-        self.assertIn("run_worker.py", long_blk)
-
     def test_allowed_backends_config_and_env_override(self):
         cfg = self.dir / "config.json"
         cfg.write_text(json.dumps({"allowed_backends": ["codex", "qoder"]}), encoding="utf-8")
@@ -923,6 +918,76 @@ print(json.dumps({"type": "turn.completed"}))
         )
         self.assertEqual(proc_env_block.returncode, 2)
         self.assertIn("disabled by AGENT_WORKER_ALLOWED", proc_env_block.stderr)
+
+
+class TimelineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("run_worker", SCRIPT)
+        cls.worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.worker)
+
+    def test_elapsed_always_has_five_ascii_characters(self):
+        for seconds, expected in (
+            (-1, "00:00"),
+            (2, "00:02"),
+            (3599, "59:59"),
+            (5999, "99:59"),
+            (6000, "1h40m"),
+            (9 * 3600 + 5 * 60, "9h05m"),
+            (35999, "9h59m"),
+            (36000, "10h+ "),
+            (100 * 3600, "99h+ "),
+        ):
+            with self.subTest(seconds=seconds), patch.object(
+                self.worker.time, "monotonic", return_value=100 + seconds
+            ):
+                timestamp = self.worker.fmt_elapsed(100)
+                self.assertEqual(timestamp, expected)
+                self.assertEqual(len(timestamp.encode("ascii")), 5)
+                self.assertEqual(self.worker.format_timeline_block("💬", "消息", timestamp).index("│"), 6)
+
+    def test_block_cleans_wraps_and_truncates_text(self):
+        full_line = "测" * 29
+        self.assertEqual(
+            self.worker.format_timeline_block("✏️", f"**{full_line}**`代码`…", "00:02"),
+            f"00:02 │ ✏️ {full_line}\n      │    代码...",
+        )
+        self.assertEqual(
+            self.worker.format_timeline_block("💬", full_line * 5, "00:19").splitlines(),
+            [
+                f"00:19 │ 💬 {full_line}",
+                f"      │    {full_line}",
+                f"      │    {full_line}",
+                f"      │    {'测' * 26}...",
+            ],
+        )
+
+    def test_groups_connect_and_consecutive_subs_are_deduplicated(self):
+        ui = self.worker.UI()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), patch.object(
+            ui, "elapsed", side_effect=["00:02", "00:19", "00:29", "00:30"]
+        ):
+            ui.sub("🧪", "检查中…")
+            ui.sub("🧪", "检查中...")
+            ui.sub("✏️", "scripts/run_worker.py")
+            ui.note("检查结果已记录。")
+            ui.sub("✏️", "scripts/run_worker.py")
+            ui.sub("✏️", "scripts/run_worker.py")
+            ui.status("⏳", "思考/执行中 (2 步)...")
+            ui.note("测试通过。")
+        self.assertEqual(output.getvalue().splitlines(), [
+            "00:02 │ 🧪 检查中...",
+            "      │ ✏️ scripts/run_worker.py",
+            "      │",
+            "00:19 │ 💬 检查结果已记录。",
+            "      │ ✏️ scripts/run_worker.py",
+            "      │",
+            "00:29 │ ⏳ 思考/执行中 (2 步)...",
+            "      │",
+            "00:30 │ 💬 测试通过。",
+        ])
 
 
 if __name__ == "__main__":

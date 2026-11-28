@@ -25,8 +25,9 @@ TEST_BUILD_RE = re.compile(
     r"swift\s+(?:build|test)|xcodebuild|tsc\b|run-tests|just\s+(?:t|l|test|check)|make\s+(?:test|check|build))\b"
 )
 PROGRESS_HINT = "工具调用之间的过渡进度说明必须使用一句简短中文（不带 Markdown 标题或列表）；最终报告语言按用户任务要求。"
-CARD_WIDTH = 54
-RULE_LINE = "─" * CARD_WIDTH
+RULE_LINE = "─" * 50
+BODY_WIDTH = 58
+TIMELINE_RAIL = "      │"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:@+-]+| +|[^A-Za-z0-9_./:@+-]")
 
 BACKENDS = ("codex", "claude", "qoder", "kimi", "devin")
@@ -57,8 +58,13 @@ DEFAULT_CONFIG_PATH = "~/.config/agent-worker/config.json"
 
 def fmt_elapsed(t0: float) -> str:
     sec = max(0, int(time.monotonic() - t0))
-    m, s = divmod(sec, 60)
-    return f"{m:02d}:{s:02d}"
+    minutes, seconds = divmod(sec, 60)
+    if minutes < 100:
+        return f"{minutes:02d}:{seconds:02d}"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours < 10:
+        return f"{hours}h{remaining_minutes:02d}m"
+    return f"{min(hours, 99):02d}h+ "
 
 
 def safe_print(text: str = "") -> float:
@@ -166,34 +172,15 @@ def clean_progress_text(text: str) -> str:
     return "\n".join(lines)
 
 
-def format_block_with_time(icon: str, text: str, ts: str, width: int = CARD_WIDTH) -> str:
-    prefix_first = f"{icon} "
-    prefix_w = disp_width(prefix_first)
-    indent = " " * prefix_w
-    body_w = max(20, width - prefix_w)
-    ts_slot = disp_width(ts) + 2  # at least 2 spaces before right-aligned timestamp
-    last_max = max(12, body_w - ts_slot)
-
-    lines = wrap_display_lines(text, body_w)
-    if not lines:
-        lines = [""]
+def format_timeline_block(icon: str, text: str, ts: str) -> str:
+    lines = wrap_display_lines(clean_progress_text(text), BODY_WIDTH) or [""]
     if len(lines) > 4:
         lines = lines[:3] + [lines[3][: max(1, len(lines[3]) - 3)].rstrip() + "..."]
 
-    # If the final line is too wide to fit the timestamp on the same line, split it cleanly so
-    # the tail words land on the next line with the timestamp at the bottom-right corner.
-    if disp_width(lines[-1]) > last_max:
-        tail_split = wrap_display_lines(lines[-1], last_max)
-        lines = lines[:-1] + tail_split
-
-    rendered: list[str] = []
-    for idx, ln in enumerate(lines):
-        pfx = prefix_first if idx == 0 else indent
-        if idx == len(lines) - 1:
-            pad = max(2, body_w - disp_width(ln) - disp_width(ts))
-            rendered.append(f"{pfx}{ln}{' ' * pad}{ts}")
-        else:
-            rendered.append(f"{pfx}{ln}")
+    icon_prefix = f"{icon} "
+    indent = " " * disp_width(icon_prefix)
+    rendered = [f"{ts} │ {icon_prefix}{lines[0]}"]
+    rendered.extend(f"{TIMELINE_RAIL} {indent}{line}" for line in lines[1:])
     return "\n".join(rendered)
 
 
@@ -279,37 +266,26 @@ class UI:
         self.t0 = time.monotonic()
         self.last_print = self.t0
         self.has_body = False
-        self.need_gap = True
         self.last_sub = None
 
     def note(self, msg: str) -> None:
-        if self.need_gap:
-            safe_print("")
-        self.last_print = safe_print(format_block_with_time("💬", msg, self.elapsed()))
-        self.has_body = True
-        self.need_gap = False
-        self.last_sub = None
+        self.status("💬", msg)
 
     def sub(self, icon: str, msg: str) -> None:
         clean_msg = msg.replace("…", "...")
         if self.last_sub == (icon, clean_msg):
             return
-        self.last_sub = (icon, clean_msg)
-        if not self.has_body:
-            safe_print("")
-            self.last_print = safe_print(format_block_with_time(icon, clean_msg, self.elapsed()))
+        if self.has_body:
+            self.last_print = safe_print(f"{TIMELINE_RAIL} {icon} {clean_msg}")
         else:
-            self.last_print = safe_print(f"   {icon} {clean_msg}")
-        self.has_body = True
-        self.need_gap = True
+            self.status(icon, clean_msg)
+        self.last_sub = (icon, clean_msg)
 
     def status(self, icon: str, msg: str) -> None:
-        clean_msg = msg.replace("…", "...")
-        if not self.has_body:
-            safe_print("")
-        self.last_print = safe_print(format_block_with_time(icon, clean_msg, self.elapsed()))
+        if self.has_body:
+            safe_print(TIMELINE_RAIL)
+        self.last_print = safe_print(format_timeline_block(icon, msg, self.elapsed()))
         self.has_body = True
-        self.need_gap = True
         self.last_sub = None
 
     def heartbeat(self, seconds: int, steps: int) -> None:
@@ -1390,13 +1366,13 @@ def main() -> int:
     if ctx.missing_bin:
         return rc
 
-    safe_print("")
-    safe_print(RULE_LINE)
+    if ui.has_body:
+        safe_print(RULE_LINE)
     if rc == 0:
-        safe_print(format_block_with_time("✅", f"完成 · {steps} 步{cost}", ui.elapsed()))
+        safe_print(format_timeline_block("✅", f"完成 · {steps} 步{cost}", ui.elapsed()))
     else:
-        safe_print(format_block_with_time("❌", f"失败 (exit {rc}) · {steps} 步", ui.elapsed()))
-        safe_print(f"   日志: {ctx.stderr_file}")
+        safe_print(format_timeline_block("❌", f"失败 (exit {rc}) · {steps} 步", ui.elapsed()))
+        safe_print(f"{TIMELINE_RAIL}    日志: {ctx.stderr_file}")
     return rc
 
 
