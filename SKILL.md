@@ -21,10 +21,10 @@ description: >-
 - **Backend defaults & launch policy** (routine → review):
   - `codex`: `-m` omitted → Codex's built-in default model (`-e medium` routine; `-e high` for review, or pass `-m <flagship>` for hard architecture/high-stakes review). Keep `service_tier=default`—never offer/use `fast`/`ultrafast` unless the user explicitly asks.
   - `claude`: routine `sonnet` (`-e medium`); review `opus` (`-e high`).
-  - `qoder`: routine `DeepSeek-Flash` (`-e high`); review `Ultimate` (`-e high`); other IDs: `DeepSeek-V4-Pro`, `Qwen4-Max`, `Kimi-K3.1-Pro`, `GLM-5.3`, `Sonus`.
+  - `qoder`: default `DeepSeek-Flash` (`-e high`) for both routine and review tasks.
   - `kimi`: `-m` omitted → `~/.kimi-code/config.toml` `default_model` (or pass explicit `-m <alias>`).
   - `devin`: `-m` omitted → Devin's configured default (or `-m sonnet|opus|codex`); `--fork` is unsupported.
-  - **Launch directly without pre-start questionnaires**: pick sensible defaults and start immediately (briefly noting the chosen worker/model in your status update). Ask upfront **only** before using unrequested high-cost configurations (e.g., high-multiplier models like `Sonus`, `opus` on long loops, or accelerated tiers). Dial routine follow-ups back to routine defaults.
+  - **Launch directly without pre-start questionnaires**: pick sensible defaults and start immediately (briefly noting the chosen worker/model in your status update). Ask upfront **only** before using unrequested high-cost configurations (e.g., `opus` on long loops or accelerated tiers). Dial routine follow-ups back to routine defaults.
 
 ## 2. Core Commands (Live Progress + Clean Context)
 

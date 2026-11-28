@@ -393,7 +393,7 @@ def resolve_model_effort(args, is_review: bool) -> tuple[str, str]:
         return (args.model or ("opus" if is_review else "sonnet"),
                 args.effort or ("high" if is_review else "medium"))
     if backend == "qoder":
-        return args.model or ("Ultimate" if is_review else "DeepSeek-Flash"), args.effort or "high"
+        return args.model or "DeepSeek-Flash", args.effort or "high"
     return args.model or "", ""
 
 

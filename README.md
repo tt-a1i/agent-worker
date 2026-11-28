@@ -95,11 +95,11 @@ cat "$d/out.md"
 | --- | --- | --- |
 | `codex` | 省略 `-m` 时使用本机 Codex 默认模型（`-e medium`） | `-e high`（高难度架构/高风险评审可显式指定旗舰 `-m`） |
 | `claude` | `sonnet`（`-e medium`） | `opus`（`-e high`） |
-| `qoder` | `DeepSeek-Flash`（`-e high`） | `Ultimate`（`-e high`） |
+| `qoder` | `DeepSeek-Flash`（`-e high`） | `DeepSeek-Flash`（`-e high`） |
 | `kimi` | 省略 `-m` 时读取 `~/.kimi-code/config.toml` 的 `default_model` | 显式传 `-m <alias>` |
 | `devin` | 省略 `-m` 时使用 Devin 已配置的默认模型 | `-m sonnet\|opus\|codex` |
 
-其它 Qoder 模型 ID：`DeepSeek-V4-Pro`、`Qwen4-Max`、`Kimi-K3.1-Pro`、`GLM-5.3`、`Sonus`。Codex 的 `service_tier` 默认保持 `default`，不建议使用 `fast`/`ultrafast`，除非用户明确要求。
+Codex 的 `service_tier` 默认保持 `default`，不建议使用 `fast`/`ultrafast`，除非用户明确要求。
 
 ## 后端能力矩阵
 

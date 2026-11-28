@@ -95,11 +95,11 @@ cat "$d/out.md"
 | --- | --- | --- |
 | `codex` | Codex built-in default when `-m` is omitted (`-e medium`) | `-e high` (pass an explicit flagship `-m` for hard architecture/high-stakes review) |
 | `claude` | `sonnet` (`-e medium`) | `opus` (`-e high`) |
-| `qoder` | `DeepSeek-Flash` (`-e high`) | `Ultimate` (`-e high`) |
+| `qoder` | `DeepSeek-Flash` (`-e high`) | `DeepSeek-Flash` (`-e high`) |
 | `kimi` | `-m` omitted → `default_model` from `~/.kimi-code/config.toml` | pass explicit `-m <alias>` |
 | `devin` | `-m` omitted → Devin's configured default | `-m sonnet\|opus\|codex` |
 
-Other Qoder model IDs: `DeepSeek-V4-Pro`, `Qwen4-Max`, `Kimi-K3.1-Pro`, `GLM-5.3`, `Sonus`. Codex keeps `service_tier=default`; do not use `fast`/`ultrafast` unless the user explicitly asks for it.
+Codex keeps `service_tier=default`; do not use `fast`/`ultrafast` unless the user explicitly asks for it.
 
 ## Backend capability matrix
 
