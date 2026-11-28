@@ -483,6 +483,7 @@ def log_error(ctx: Ctx, msg: str, mode: str = "a") -> None:
 
 def write_report(ctx: Ctx, body: str, rc: int, ui: UI) -> int:
     try:
+        ctx.out_file.parent.mkdir(parents=True, exist_ok=True)
         ctx.out_file.write_text(body or "", encoding="utf-8")
     except OSError as exc:
         log_error(ctx, f"❌ 无法写入报告 {ctx.out_file}: {exc}")
@@ -1554,7 +1555,11 @@ def main() -> int:
     finally:
         if ctx.canceled:
             rc = 128 + ctx.cancel_sig
-        ctx.exit_file.write_text(f"{rc}\n", encoding="utf-8")
+        try:
+            ctx.out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            ctx.exit_file.write_text(f"{rc}\n", encoding="utf-8")
+        except OSError:
+            pass
 
     if ui.has_body:
         safe_print(RULE_LINE)
