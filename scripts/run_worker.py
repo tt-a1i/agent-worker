@@ -56,6 +56,7 @@ DRAIN_DEADLINE = 0.5
 KIMI_FORK_TIMEOUT = 30.0
 KIMI_PROMPT_FILE_THRESHOLD = 96_000
 DEVIN_POLL_INTERVAL = 1.0
+THINK_INTERVAL = 12.0
 DEFAULT_CONFIG_PATH = "~/.config/agent-worker/config.json"
 
 
@@ -188,6 +189,40 @@ def format_timeline_block(icon: str, text: str, ts: str | None = None) -> str:
     return "\n".join(rendered)
 
 
+def truncate_display_width(text: str, max_w: int) -> str:
+    if disp_width(text) <= max_w:
+        return text
+    limit = max(1, max_w - 3)
+    out: list[str] = []
+    w = 0
+    for ch in text:
+        cw = char_width(ch)
+        if w + cw > limit:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out).rstrip() + "..."
+
+
+def summarize_thought(text: str, max_w: int = BODY_WIDTH) -> str:
+    cleaned = clean_progress_text(text)
+    if not cleaned:
+        return ""
+    first = cleaned.splitlines()[0].strip()
+    first = re.sub(r"^(?:#+\s*|[-*•]\s*|\d+[.)]\s*)", "", first).strip()
+    if not first:
+        return ""
+    if disp_width(first) > max_w:
+        for sep in ("。", "！", "？", ". ", "; ", "；"):
+            idx = first.find(sep)
+            if idx > 0:
+                cand = first[: idx + (1 if sep in "。！？；" else 0)].strip()
+                if 10 <= disp_width(cand) <= max_w:
+                    return cand
+        return truncate_display_width(first, max_w)
+    return first
+
+
 def content_text(content) -> str:
     if isinstance(content, str):
         return content
@@ -199,6 +234,24 @@ def content_text(content) -> str:
             elif isinstance(block, str):
                 parts.append(block)
         return "".join(parts)
+    return ""
+
+
+def extract_thinking(msg_or_ev: dict) -> str:
+    rc = msg_or_ev.get("reasoning_content")
+    if isinstance(rc, str) and rc.strip():
+        return rc
+    content = msg_or_ev.get("content")
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("thinking", "think", "reasoning"):
+                val = block.get("thinking") or block.get("think") or block.get("text") or ""
+                if isinstance(val, str) and val.strip():
+                    parts.append(val)
+        return "\n".join(parts)
     return ""
 
 
@@ -266,14 +319,32 @@ def handle_tools(tools, ctx, ui, steps_ref: dict, seen: set) -> None:
 
 
 class UI:
-    def __init__(self):
+    def __init__(self, thinking_mode: str = "auto"):
         self.t0 = time.monotonic()
         self.last_print = self.t0
+        self.last_narrative = self.t0
+        self.thinking_mode = thinking_mode
+        self.last_thought = ""
         self.has_body = False
         self.last_sub = None
 
     def note(self, msg: str) -> None:
+        self.last_narrative = time.monotonic()
+        self.last_thought = ""
         self.status("💬", msg)
+
+    def thought(self, raw: str) -> None:
+        if self.thinking_mode == "off":
+            return
+        summary = summarize_thought(raw)
+        if not summary or summary == self.last_thought:
+            return
+        now = time.monotonic()
+        if self.thinking_mode == "auto" and (now - self.last_narrative) < THINK_INTERVAL:
+            return
+        self.last_thought = summary
+        self.last_narrative = now
+        self.status("💭", summary)
 
     def sub(self, icon: str, msg: str) -> None:
         clean_msg = msg.replace("…", "...")
@@ -625,6 +696,8 @@ def run_codex(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
         "-c", f"model_reasoning_effort={ctx.effort}",
         "-c", f"service_tier={a.tier}",
     ])
+    if a.thinking != "off":
+        cmd.extend(["-c", "model_reasoning_summary=concise"])
     if not ctx.is_review:
         cmd.extend(["-c", f"developer_instructions={PROGRESS_HINT}"])
 
@@ -684,6 +757,16 @@ def run_codex(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
                     flush_pending_note()
                     st["last_agent_text"] = txt
                     st["pending_note"] = txt
+            elif itype == "reasoning":
+                if not st["pending_note"]:
+                    rtxt = item.get("text") or ""
+                    if not rtxt and isinstance(item.get("summary"), list):
+                        rtxt = "\n".join(
+                            s.get("text", "") if isinstance(s, dict) else str(s)
+                            for s in item["summary"]
+                        )
+                    if isinstance(rtxt, str) and rtxt.strip():
+                        ui.thought(rtxt)
             elif itype == "file_change":
                 flush_pending_note()
                 st["steps"] += 1
@@ -821,6 +904,10 @@ def run_claude_like(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
             stop_reason = msg.get("stop_reason")
             blocks = msg.get("content") or []
             has_tool = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)
+            has_text = any(
+                isinstance(b, dict) and b.get("type") == "text" and str(b.get("text", "")).strip()
+                for b in blocks
+            )
 
             for block in blocks:
                 if not isinstance(block, dict) or block.get("type") != "text":
@@ -838,6 +925,13 @@ def run_claude_like(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
                         st["flushed_mids"].add(mid)
                     elif stop_reason != "end_turn":
                         st["buffered_texts"].setdefault(mid, []).append(txt)
+
+            if not has_text:
+                think_txt = extract_thinking(msg)
+                tkey = ("think", mid, think_txt.strip())
+                if think_txt.strip() and tkey not in st["seen_texts"]:
+                    st["seen_texts"].add(tkey)
+                    ui.thought(think_txt)
 
             if stop_reason == "tool_use" or has_tool:
                 flush_mid(mid)
@@ -986,15 +1080,20 @@ def run_kimi(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
             return
 
         txt = content_text(ev.get("content"))
+        think_txt = extract_thinking(ev)
         tools = ev.get("tool_calls") or []
         if tools:
             if txt.strip():
                 cleaned = clean_progress_text(txt)
                 if cleaned:
                     ui.note(cleaned)
+            elif think_txt.strip():
+                ui.thought(think_txt)
             handle_tools(tools, ctx, ui, st, st["tool_seen"])
         elif txt.strip():
             st["last_assistant_text"] = txt
+        elif think_txt.strip():
+            ui.thought(think_txt)
 
     try:
         if prompt_file is not None:
@@ -1171,13 +1270,18 @@ def run_devin(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
             ev_out.flush()
             if cm.get("role") == "assistant":
                 tools = cm.get("tool_calls") or []
+                think_txt = extract_thinking(cm)
                 if tools:
                     txt = content_text(cm.get("content"))
                     if txt.strip():
                         cleaned = clean_progress_text(txt)
                         if cleaned:
                             ui.note(cleaned)
+                    elif think_txt.strip():
+                        ui.thought(think_txt)
                     handle_tools(tools, ctx, ui, st, st["tool_seen"])
+                elif think_txt.strip():
+                    ui.thought(think_txt)
             st["nodes_seen"].add(key)
 
     def poll_db(final: bool = False) -> None:
@@ -1275,6 +1379,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--include-user-config", action="store_true", help="Keep global user config/MCPs instead of isolated defaults")
     ap.add_argument("--ephemeral", "--no-session-persistence", dest="ephemeral", action="store_true",
                     help="Do not persist the session (codex/claude/qoder only; never with --resume/--fork)")
+    ap.add_argument("--thinking", choices=("auto", "on", "off"), default="auto",
+                    help="Single-line 💭 reasoning preview (codex/claude/qoder/devin): auto (after 12s without 💬), on, or off")
     ap.add_argument("--heartbeat", type=int, default=40, help="Seconds of silence before printing a heartbeat")
     ap.add_argument("prompt", nargs="?", default="", help="Prompt text (reads UTF-8 stdin if omitted)")
     return ap
@@ -1407,7 +1513,7 @@ def main() -> int:
         ctx.exit_file.write_text("2\n", encoding="utf-8")
         return 2
 
-    ui = UI()
+    ui = UI(args.thinking)
 
     if args.resume is not None:
         mode_label = f"resume:{args.resume[:8]}"

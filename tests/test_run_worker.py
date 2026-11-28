@@ -1223,6 +1223,53 @@ class RunnerUnitTests(unittest.TestCase):
             "00:30 │ 💬 测试通过。",
         ])
 
+    def test_thought_summary_auto_throttling_and_modes(self):
+        with patch.object(self.worker.time, "monotonic", return_value=100.0):
+            ui_auto = self.worker.UI("auto")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            # Suppressed during initial <12s window
+            with patch.object(self.worker.time, "monotonic", return_value=105.0):
+                ui_auto.thought("**Initial quick check**\nDetails ignored")
+            # Emitted once >=12s of silence has elapsed
+            with patch.object(self.worker.time, "monotonic", return_value=113.0), patch.object(
+                ui_auto, "elapsed", return_value="00:13"
+            ):
+                ui_auto.thought("**Inspecting signal teardown window**\nSecond line")
+            # Duplicate or <12s follow-up suppressed
+            with patch.object(self.worker.time, "monotonic", return_value=118.0):
+                ui_auto.thought("**Another rapid thought**")
+            # Human note resets narrative clock
+            with patch.object(self.worker.time, "monotonic", return_value=120.0), patch.object(
+                ui_auto, "elapsed", return_value="00:20"
+            ):
+                ui_auto.note("已定位问题。")
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            [
+                "00:13 │ 💭 Inspecting signal teardown window",
+                "      │",
+                "00:20 │ 💬 已定位问题。",
+            ],
+        )
+
+        # --thinking on prints immediately and truncates to a single line
+        ui_on = self.worker.UI("on")
+        out_on = io.StringIO()
+        with contextlib.redirect_stdout(out_on), patch.object(ui_on, "elapsed", return_value="00:01"):
+            ui_on.thought("# " + ("长" * 40))
+        lines_on = out_on.getvalue().splitlines()
+        self.assertEqual(len(lines_on), 1)
+        self.assertTrue(lines_on[0].startswith("00:01 │ 💭 "))
+        self.assertTrue(lines_on[0].endswith("..."))
+
+        # --thinking off suppresses completely
+        ui_off = self.worker.UI("off")
+        out_off = io.StringIO()
+        with contextlib.redirect_stdout(out_off):
+            ui_off.thought("**Hidden**")
+        self.assertEqual(out_off.getvalue(), "")
+
 
 if __name__ == "__main__":
     unittest.main()
