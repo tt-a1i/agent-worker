@@ -31,7 +31,7 @@ description: >-
 Resolve `<skill-dir>` to the directory containing this `SKILL.md`. Single entrypoint: `python3 "<skill-dir>/scripts/run_worker.py" <codex|claude|qoder|kimi|devin> ...`. It streams readable commentary, changed files, test cues, and 40s heartbeats to stdout while saving raw events to `"$d/events.jsonl"`, confirmed session ID to `"$d/sid"`, and the final report to `"$d/out.md"` (requires POSIX macOS/Linux).
 
 - **Direct background process ownership**: launch each worker as its **own** native background tool call (e.g., Bash `run_in_background: true`). **Never** detach via subshell `(&)` + `while sleep` polling, and do **not** multiplex multiple concurrent workers via `&` + `wait` inside one shell script (which scrambles their live progress streams together).
-- Read **only** `"$d/out.md"` on exit `0`; inspect `"$d/stderr.log"` / `"$d/events.jsonl"` only on failure.
+- On exit `0`, read only the report path printed in the summary (`"$d/out.md"` or the custom `-o` file). Inspect `"$d/stderr.log"` and `"$d/events.jsonl"` only on failure.
 
 ### Execute Task
 ```bash
@@ -51,7 +51,7 @@ python3 "<skill-dir>/scripts/run_worker.py" codex -C "$repo" -d "$d2" -o "$d2/re
 # Plan critique (all backends) or diff review on claude/qoder/kimi/devin — use quoted <<'EOF':
 d3=$(mktemp -d /tmp/worker.review.XXXXXX)
 python3 "<skill-dir>/scripts/run_worker.py" qoder -C "$repo" -d "$d3" -o "$d3/review.md" --review <<'EOF'
-Read-only review (do not modify files): inspect git diff <base>...HEAD (or verify plan against codebase) and report real bugs, regressions, and missing edge cases.
+Read-only review. Inspect git diff <base>...HEAD (or verify the plan against the codebase) and report real bugs, regressions, and missing edge cases. Do not create or modify files, snapshots, or other artifacts.
 EOF
 ```
 
@@ -68,7 +68,7 @@ EOF
 ## 3. High-Leverage Guardrails
 
 - **Session reuse (`--resume` vs `--fork` vs fresh)**: `--resume` while investigation context is still lean. Once a session has stacked many rounds, **stop stacking `--resume`**—handle small follow-ups directly in the host or start fresh with a concise handoff instead of re-billing a bloated transcript.
-- **Scoped verification & transparent report**: pass failing commands, key errors, relevant paths, ruled-out causes, and the stopping point (uncommitted diff vs commit vs PR). Instruct the worker to follow repo docs and run **fast, targeted non-interactive checks matching the change's impact** (updating affected generated artifacts/snapshots if touched, without running slow full-CI suites), and in `"$d/out.md"` report **exact verification commands run, any non-obvious toolchain/env paths used, unverified areas, and out-of-scope edits**.
+- **Scoped verification and reporting**. Pass failing commands, key errors, relevant paths, ruled-out causes, and the stopping point (uncommitted diff, commit, or PR). Ask the worker to follow repo docs, run **fast, targeted non-interactive checks matching the change's impact**, and update affected generated artifacts or snapshots for write tasks when required. In the final response, the worker should report the **exact verification commands run, any non-obvious toolchain or environment paths, unverified areas, and out-of-scope edits**. The runner saves that response automatically. Tell the worker to avoid creating report files in `$repo`.
 - **Parallelism & `git worktree` discipline**:
-  - **Read-only fan-out (no worktree needed)**: run multi-angle reviews, audits, or cross-model critiques concurrently against the same checkout via separate native background tool calls.
+  - **Read-only fan-out (no worktree needed)**: run concurrent reviews of the same checkout in separate native background tool calls. Because all backends run with autonomous permissions rather than an OS read-only sandbox, forbid file, snapshot, and artifact changes in review prompts (use an isolated `git worktree` when the user requires a hard write boundary).
   - **Write tasks (default to batching; split worktrees sparingly)**: never run two write workers in the same checkout concurrently (queue new feedback while a run is active; if a host wait times out, verify whether the task is still alive before acting). Prefer **batching related or small/medium edits into one worker** rather than splitting multiple `git worktree`s (which multiplies repo-reading cost, lacks `node_modules`/venv/build caches in fresh checkouts, and creates rebase/artifact conflicts). Create external `git worktree` checkouts **only** when tasks are long-running, touch orthogonal paths, and can run tests without costly environment rebuilds; rebase, rebuild shared artifacts, re-run affected checks when landing sequentially, then clean up worktrees and `$d` dirs.

@@ -72,13 +72,18 @@ class WorkerTests(unittest.TestCase):
         return path
 
     def env_for(self, backend, mock, env_extra=None):
-        env = os.environ.copy()
+        env = {
+            key: value for key, value in os.environ.items()
+            if not (key.startswith(("AGENT_WORKER_", "CLI_WORKER_")) and key.endswith("_BIN"))
+            and key not in ("AGENT_WORKER_DEVIN_DB", "CLI_WORKER_DEVIN_DB")
+        }
         env["PYTHONIOENCODING"] = "utf-8"
         env["AGENT_WORKER_CONFIG"] = ""
         env.pop("AGENT_WORKER_ALLOWED", None)
-        env[f"CLI_WORKER_{backend.upper()}_BIN"] = str(mock)
+        env["AGENT_WORKER_DEVIN_DB"] = str(self.dir / "isolated-devin.db")
         if env_extra:
             env.update(env_extra)
+        env[f"AGENT_WORKER_{backend.upper()}_BIN"] = str(mock)
         return env
 
     def run_cli(self, backend, mock, *args, prompt=None, stdin_text=None, env_extra=None,
@@ -88,31 +93,22 @@ class WorkerTests(unittest.TestCase):
         outdir_path = pathlib.Path(outdir)
         if not outdir_path.is_absolute():
             outdir_path = pathlib.Path(cwd or os.getcwd()) / outdir_path
-        cmd = [sys.executable, str(SCRIPT), backend, "-C", str(repo or self.repo), "-d", str(outdir), *args]
+        argv = ["-C", str(repo or self.repo), "-d", str(outdir), *args]
         if prompt is not None:
-            cmd.append(prompt)
-        proc = subprocess.run(
-            cmd,
-            input=stdin_text if stdin_text is not None else "",
-            capture_output=True,
-            text=True,
-            env=self.env_for(backend, mock, env_extra),
-            timeout=timeout,
-            cwd=cwd,
+            argv.append(prompt)
+        proc = self.run_argv(
+            backend, mock, argv, stdin_text=stdin_text or "",
+            env_extra=env_extra, cwd=cwd, timeout=timeout,
         )
         return proc, outdir_path
 
-    def run_argv(self, argv, *, stdin_text="", env=None, cwd=None, timeout=90):
-        if env is None:
-            env = os.environ.copy()
-            env["AGENT_WORKER_CONFIG"] = ""
-            env.pop("AGENT_WORKER_ALLOWED", None)
+    def run_argv(self, backend, mock, argv, *, stdin_text="", env_extra=None, cwd=None, timeout=90):
         return subprocess.run(
-            [sys.executable, str(SCRIPT), *argv],
+            [sys.executable, str(SCRIPT), backend, *argv],
             input=stdin_text,
             capture_output=True,
             text=True,
-            env=env,
+            env=self.env_for(backend, mock, env_extra),
             cwd=cwd,
             timeout=timeout,
         )
@@ -121,7 +117,7 @@ class WorkerTests(unittest.TestCase):
         return (outdir / name).read_text(encoding="utf-8")
 
     def init_devin_db(self):
-        db = self.dir / "sessions.db"
+        db = self.path("sessions.db")
         conn = sqlite3.connect(str(db))
         conn.executescript(DEVIN_SCHEMA)
         conn.commit()
@@ -168,13 +164,14 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read(outdir, "out.md"), "Final report body")
         self.assertEqual(self.read(outdir, "sid").strip(), "th-123")
-        header, top, first, sub, bottom, summary = proc.stdout.splitlines()
+        header, top, first, sub, bottom, summary, report = proc.stdout.splitlines()
         self.assertEqual(header, "🚀 Codex · default (medium) · repo")
         self.assertEqual(top, "─" * 50)
         self.assertRegex(first, r"^[0-9]{2}:[0-9]{2} │ 🧪 运行测试/检查中\.\.\.$")
         self.assertEqual(sub, "      │ ✏️ a.py")
         self.assertEqual(bottom, top)
         self.assertRegex(summary, r"^[0-9]{2}:[0-9]{2} │ ✅ 完成 · 2 步$")
+        self.assertEqual(report, f"      │    报告: {outdir / 'out.md'}")
         argv = json.loads(argv_file.read_text())
         self.assertIn("--ignore-user-config", argv)
         self.assertIn("model_reasoning_effort=medium", argv)
@@ -229,10 +226,11 @@ class WorkerTests(unittest.TestCase):
         proc, outdir = self.run_cli("codex", mock, "--heartbeat", "0", prompt="do it")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read(outdir, "out.md"), "FINAL ANSWER")
-        header, rule, summary = proc.stdout.splitlines()
+        header, rule, summary, report = proc.stdout.splitlines()
         self.assertEqual(header, "🚀 Codex · default (medium) · repo")
         self.assertEqual(rule, "─" * 50)
         self.assertRegex(summary, r"^[0-9]{2}:[0-9]{2} │ ✅ 完成 · 0 步$")
+        self.assertEqual(report, f"      │    报告: {outdir / 'out.md'}")
 
     def test_codex_failure_without_progress_has_one_rule(self):
         mock = self.write_mock("codex", "sys.exit(3)\n")
@@ -324,12 +322,29 @@ class WorkerTests(unittest.TestCase):
     def test_claude_fork_does_not_publish_parent_sid(self):
         outdir = self.path("fork-sid")
         mock = self.write_mock("claude", """
-            print(json.dumps({"type": "result", "is_error": False, "result": "boom"}), flush=True)
+            print(json.dumps({"type": "result", "session_id": "parent-sid", "result": "boom"}), flush=True)
             sys.exit(1)
         """)
         proc, _ = self.run_cli("claude", mock, "--fork", "parent-sid", prompt="go", outdir=outdir)
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertFalse((outdir / "sid").exists())
+
+    def test_claude_and_qoder_do_not_publish_sid_on_immediate_crash(self):
+        for backend in ("claude", "qoder"):
+            with self.subTest(backend=backend):
+                mock = self.write_mock(backend, "sys.exit(23)\n")
+                proc, outdir = self.run_cli(backend, mock, prompt="go")
+                self.assertEqual(proc.returncode, 23, proc.stderr)
+                self.assertFalse((outdir / "sid").exists())
+
+    def test_inherited_backend_override_cannot_replace_mock(self):
+        mock = self.write_mock("claude", """
+            print(json.dumps({"type": "result", "result": "mock used"}))
+        """)
+        with patch.dict(os.environ, {"AGENT_WORKER_CLAUDE_BIN": str(self.dir / "unexpected-bin")}):
+            proc, outdir = self.run_cli("claude", mock, prompt="go")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read(outdir, "out.md"), "mock used")
 
     # ------------------------------------------------------------------ qoder
 
@@ -479,13 +494,20 @@ class WorkerTests(unittest.TestCase):
             argv = sys.argv[1:]
             prompt_path = argv[argv.index("--prompt-file") + 1]
             open(os.environ["MOCK_PROMPT_COPY"], "w", encoding="utf-8").write(open(prompt_path, encoding="utf-8").read())
-            db = sqlite3.connect(os.environ["CLI_WORKER_DEVIN_DB"])
+            db = sqlite3.connect(os.environ["AGENT_WORKER_DEVIN_DB"])
             repo = os.path.realpath(os.getcwd())
-            db.execute("INSERT INTO sessions VALUES (?,?,?,?)", ("sess-devin", repo, time.time(), "n2"))
-            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n1", None, "sess-devin", {node1!r}))
+            db.execute("INSERT INTO sessions VALUES (?,?,?,?)", ("sess-devin", repo, time.time(), "n1"))
+            user = json.dumps({{"role": "user", "content": prompt_path}})
+            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("u", None, "sess-devin", user))
+            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n1", "u", "sess-devin", {node1!r}))
             db.commit()
-            time.sleep(1.15)
+            sid_path = os.path.join(os.path.dirname(prompt_path), "sid")
+            deadline = time.monotonic() + 5
+            while not os.path.exists(sid_path) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert os.path.exists(sid_path), "prompt-file reference did not confirm the session live"
             db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n2", "n1", "sess-devin", {node2!r}))
+            db.execute("UPDATE sessions SET main_chain_id = ? WHERE id = ?", ("n2", "sess-devin"))
             db.commit()
             db.close()
             sys.stdout.write("devin final")
@@ -496,7 +518,7 @@ class WorkerTests(unittest.TestCase):
             mock,
             prompt="do devin",
             env_extra={
-                "CLI_WORKER_DEVIN_DB": str(db),
+                "AGENT_WORKER_DEVIN_DB": str(db),
                 "MOCK_ARGV": str(argv_file),
                 "MOCK_PROMPT_COPY": str(copy_file),
             },
@@ -530,17 +552,18 @@ class WorkerTests(unittest.TestCase):
         conn.close()
         new_node = tool_node("new_file.py", text="新会话")
         mock = self.write_mock("devin", f"""
-            db = sqlite3.connect(os.environ["CLI_WORKER_DEVIN_DB"])
+            db = sqlite3.connect(os.environ["AGENT_WORKER_DEVIN_DB"])
             repo = os.path.realpath(os.getcwd())
             db.execute("INSERT INTO sessions VALUES (?,?,?,?)", ("sess-new", repo, time.time(), "n1"))
-            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n1", None, "sess-new", {new_node!r}))
+            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("u", None, "sess-new", json.dumps({{"role": "user", "content": "go"}})))
+            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n1", "u", "sess-new", {new_node!r}))
             db.commit()
             db.close()
             sys.stdout.write("new report")
             sys.stdout.flush()
         """)
         proc, outdir = self.run_cli(
-            "devin", mock, prompt="go", env_extra={"CLI_WORKER_DEVIN_DB": str(db)}, timeout=30
+            "devin", mock, prompt="go", env_extra={"AGENT_WORKER_DEVIN_DB": str(db)}, timeout=30
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read(outdir, "sid").strip(), "sess-new")
@@ -554,10 +577,10 @@ class WorkerTests(unittest.TestCase):
         branch = tool_node("zz_branch.py", text="分支")
         main = tool_node("aaa_main.py", text="主链")
         mock = self.write_mock("devin", f"""
-            db = sqlite3.connect(os.environ["CLI_WORKER_DEVIN_DB"])
+            db = sqlite3.connect(os.environ["AGENT_WORKER_DEVIN_DB"])
             repo = os.path.realpath(os.getcwd())
             db.execute("INSERT INTO sessions VALUES (?,?,?,?)", ("sess-tree", repo, time.time(), "n3"))
-            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n1", None, "sess-tree", json.dumps({{"role": "user", "content": "hi"}})))
+            db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n1", None, "sess-tree", json.dumps({{"role": "user", "content": "go"}})))
             db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n2", "n1", "sess-tree", {branch!r}))
             db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n3", "n1", "sess-tree", {main!r}))
             db.commit()
@@ -566,7 +589,7 @@ class WorkerTests(unittest.TestCase):
             sys.stdout.flush()
         """)
         proc, outdir = self.run_cli(
-            "devin", mock, prompt="go", env_extra={"CLI_WORKER_DEVIN_DB": str(db)}, timeout=30
+            "devin", mock, prompt="go", env_extra={"AGENT_WORKER_DEVIN_DB": str(db)}, timeout=30
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("aaa_main.py", proc.stdout)
@@ -575,6 +598,93 @@ class WorkerTests(unittest.TestCase):
         events = self.read(outdir, "events.jsonl")
         self.assertIn("aaa_main.py", events)
         self.assertNotIn("zz_branch.py", events)
+
+    def test_devin_discards_unconfirmed_events_when_second_session_appears(self):
+        db = self.init_devin_db()
+        first = tool_node("other.py")
+        second = tool_node("local.py")
+        mock = self.write_mock("devin", f"""
+            conn = sqlite3.connect(os.environ["AGENT_WORKER_DEVIN_DB"])
+            repo = os.path.realpath(os.getcwd())
+            user = json.dumps({{"role": "user", "content": "same prompt"}})
+            for sid, chat in (("other", {first!r}), ("local", {second!r})):
+                conn.execute("INSERT INTO sessions VALUES (?,?,?,?)", (sid, repo, time.time(), "tool"))
+                conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("user", None, sid, user))
+                conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("tool", "user", sid, chat))
+                conn.commit()
+                if sid == "other":
+                    time.sleep(1.2)
+            conn.close()
+            print("stdout-only report", end="")
+        """)
+        proc, outdir = self.run_cli(
+            "devin", mock, prompt="same prompt", env_extra={"AGENT_WORKER_DEVIN_DB": str(db)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read(outdir, "out.md"), "stdout-only report")
+        self.assertFalse((outdir / "sid").exists())
+        self.assertEqual(self.read(outdir, "events.jsonl"), "")
+        self.assertNotIn("other.py", proc.stdout)
+        self.assertNotIn("local.py", proc.stdout)
+
+    def test_devin_rejects_mismatched_prompt_or_stale_session(self):
+        for age, user in ((0, "someone else's prompt"), (60, "go"), (0, None)):
+            with self.subTest(age=age, user=user):
+                db = self.init_devin_db()
+                mock = self.write_mock("devin", f"""
+                    conn = sqlite3.connect(os.environ["AGENT_WORKER_DEVIN_DB"])
+                    with conn:
+                        conn.execute("INSERT INTO sessions VALUES (?,?,?,?)",
+                                     ("other", os.path.realpath(os.getcwd()), time.time() - {age}, "tail"))
+                        if {user is not None}:
+                            u = json.dumps({{"role": "user", "content": {user!r}}})
+                            conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("tail", None, "other", u))
+                        else:
+                            a = json.dumps({{"role": "assistant", "content": "orphan", "tool_calls": []}})
+                            conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("tail", None, "other", a))
+                    print("stdout-only report", end="")
+                """)
+                proc, outdir = self.run_cli(
+                    "devin", mock, prompt="go", env_extra={"AGENT_WORKER_DEVIN_DB": str(db)},
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.read(outdir, "out.md"), "stdout-only report")
+                self.assertFalse((outdir / "sid").exists())
+                self.assertEqual(self.read(outdir, "events.jsonl"), "")
+
+    def test_devin_locked_prompt_file_survives_later_concurrent_session(self):
+        db = self.init_devin_db()
+        node1 = tool_node("first.py", text="第一阶段")
+        node2 = tool_node("second.py", text="第二阶段")
+        other_node = tool_node("intruder.py", text="隔壁会话")
+        mock = self.write_mock("devin", f"""
+            argv = sys.argv[1:]
+            prompt_path = argv[argv.index("--prompt-file") + 1]
+            conn = sqlite3.connect(os.environ["AGENT_WORKER_DEVIN_DB"])
+            repo = os.path.realpath(os.getcwd())
+            with conn:
+                conn.execute("INSERT INTO sessions VALUES (?,?,?,?)", ("mine", repo, time.time(), "n1"))
+                conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)",
+                             ("u", None, "mine", json.dumps({{"role": "user", "content": prompt_path}})))
+                conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n1", "u", "mine", {node1!r}))
+            sid_path = os.path.join(os.path.dirname(prompt_path), "sid")
+            deadline = time.monotonic() + 5
+            while not os.path.exists(sid_path) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            with conn:
+                conn.execute("INSERT INTO sessions VALUES (?,?,?,?)", ("other", repo, time.time(), "o1"))
+                conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("o1", None, "other", {other_node!r}))
+                conn.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n2", "n1", "mine", {node2!r}))
+                conn.execute("UPDATE sessions SET main_chain_id = ? WHERE id = ?", ("n2", "mine"))
+            conn.close()
+            print("locked ok", end="")
+        """)
+        proc, outdir = self.run_cli("devin", mock, prompt="work", env_extra={"AGENT_WORKER_DEVIN_DB": str(db)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.read(outdir, "sid").strip(), "mine")
+        self.assertIn("first.py", proc.stdout)
+        self.assertIn("second.py", proc.stdout)
+        self.assertNotIn("intruder.py", proc.stdout)
 
     def test_devin_resume_skips_baseline_nodes(self):
         db = self.init_devin_db()
@@ -588,7 +698,7 @@ class WorkerTests(unittest.TestCase):
         conn.close()
         new_node = tool_node("followup.py", text="新步骤")
         mock = self.write_mock("devin", f"""
-            db = sqlite3.connect(os.environ["CLI_WORKER_DEVIN_DB"])
+            db = sqlite3.connect(os.environ["AGENT_WORKER_DEVIN_DB"])
             db.execute("INSERT INTO message_nodes VALUES (?,?,?,?)", ("n2", "n1", {sid!r}, {new_node!r}))
             db.execute("UPDATE sessions SET main_chain_id = ? WHERE id = ?", ("n2", {sid!r}))
             db.commit()
@@ -598,7 +708,7 @@ class WorkerTests(unittest.TestCase):
         """)
         proc, outdir = self.run_cli(
             "devin", mock, "--resume", sid, prompt="continue",
-            env_extra={"CLI_WORKER_DEVIN_DB": str(db)}, timeout=30,
+            env_extra={"AGENT_WORKER_DEVIN_DB": str(db)}, timeout=30,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read(outdir, "sid").strip(), sid)
@@ -668,11 +778,23 @@ class WorkerTests(unittest.TestCase):
 
     def test_sigterm_kills_grandchild_surviving_leader(self):
         pid_file = self.dir / "grandchild.pid"
-        grandchild = "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n"
+        cleanup_file = self.dir / "cleanup"
+        grandchild = textwrap.dedent(f"""
+            import os, signal, time
+            signals = 0
+            def term(*args):
+                global signals
+                signals += 1
+                if signals == 2:
+                    open({str(cleanup_file)!r}, "w").close()
+            signal.signal(signal.SIGTERM, term)
+            with open({str(pid_file)!r}, "w") as fh:
+                fh.write(str(os.getpid()))
+            time.sleep(60)
+        """)
         mock = self.write_mock("claude", f"""
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            p = subprocess.Popen([sys.executable, "-c", {grandchild!r}])
-            open({str(pid_file)!r}, "w").write(str(p.pid))
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+            subprocess.Popen([sys.executable, "-c", {grandchild!r}], stdout=subprocess.DEVNULL)
             time.sleep(60)
         """)
         outdir = self.path("sigterm-out")
@@ -685,18 +807,31 @@ class WorkerTests(unittest.TestCase):
             text=True,
             env=self.env_for("claude", mock),
         )
+        reaped = False
         try:
             deadline = time.monotonic() + 10
             while not pid_file.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertTrue(pid_file.exists(), "grandchild never started")
-            start = time.monotonic()
             os.kill(proc.pid, signal.SIGTERM)
-            proc.communicate(timeout=20)
-            elapsed = time.monotonic() - start
-            self.assertLess(elapsed, 12.0)
+            deadline = time.monotonic() + 4
+            while not cleanup_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(cleanup_file.exists(), "the runner never entered group teardown")
+            os.kill(proc.pid, signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=4)
+            self.assertEqual(proc.returncode, 143, stderr)
+            self.assertEqual(self.read(outdir, "exit"), "143\n")
+            self.assertIn("❌ 已取消 (exit 143) · 0 步", stdout)
+            self.assertIn(f"      │    日志: {outdir / 'stderr.log'}", stdout)
             self.assert_pid_reaped(int(pid_file.read_text()))
+            reaped = True
         finally:
+            if not reaped and pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate()
@@ -718,7 +853,7 @@ class WorkerTests(unittest.TestCase):
         """)
         proc, outdir = self.run_cli(
             "devin", mock, prompt="rel", cwd=self.dir, outdir="relative-out",
-            env_extra={"MOCK_PROMPT_COPY": str(copy_file), "CLI_WORKER_DEVIN_DB": str(self.dir / "none.db")},
+            env_extra={"MOCK_PROMPT_COPY": str(copy_file), "AGENT_WORKER_DEVIN_DB": str(self.dir / "none.db")},
             timeout=30,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -757,8 +892,7 @@ class WorkerTests(unittest.TestCase):
         """)
         outdir = self.path("intermixed")
         proc = self.run_argv(
-            ["claude", "go", "-C", str(self.repo), "-d", str(outdir)],
-            env=self.env_for("claude", mock),
+            "claude", mock, ["go", "-C", str(self.repo), "-d", str(outdir)],
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.read(outdir, "out.md"), "intermixed ok")
@@ -768,6 +902,23 @@ class WorkerTests(unittest.TestCase):
         proc, _ = self.run_cli("codex", missing, "--base", "main", "--commit", "abc123", prompt="x")
         self.assertEqual(proc.returncode, 2)
         self.assertIn("not allowed with", proc.stderr)
+
+    def test_fixed_codex_review_rejects_prompt_after_whitespace(self):
+        text = (" " * 5000) + "extra prompt"
+        mock = self.dir / "unused-codex"
+        proc, _ = self.run_cli("codex", mock, "--base", "main", stdin_text=text)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("do not accept a prompt", proc.stderr)
+
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(text.encode("utf-8"))
+            stdin.seek(0)
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "codex", "--base", "main"],
+                stdin=stdin, capture_output=True, text=True, env=self.env_for("codex", mock),
+            )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("do not accept a prompt", proc.stderr)
 
     def test_ephemeral_rejected_for_kimi_and_devin(self):
         missing = self.dir / "missing"
@@ -851,6 +1002,56 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.read(outdir, "exit").strip(), "2")
         self.assertIn("不能是目录", self.read(outdir, "stderr.log"))
 
+    def test_output_parent_is_created_before_launch(self):
+        report = self.dir / "nested" / "reports" / "custom.md"
+        mock = self.write_mock("claude", f"""
+            assert os.path.isdir({str(report.parent)!r})
+            print(json.dumps({{"type": "result", "result": "custom report"}}))
+        """)
+        proc, outdir = self.run_cli("claude", mock, "-o", str(report), prompt="go")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(report.read_text(encoding="utf-8"), "custom report")
+        self.assertTrue(proc.stdout.endswith(f"      │    报告: {report}\n"))
+        self.assertFalse((outdir / "out.md").exists())
+
+    def test_invalid_output_parent_prevents_backend_launch(self):
+        parent = self.dir / "regular-file"
+        parent.touch()
+        argv = self.dir / "argv.json"
+        mock = self.write_mock("claude", "sys.exit(23)\n")
+        proc, outdir = self.run_cli(
+            "claude", mock, "-o", str(parent / "out.md"), prompt="go",
+            env_extra={"MOCK_ARGV": str(argv)},
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(self.read(outdir, "exit"), "2\n")
+        self.assertIn("无法准备输出报告路径", self.read(outdir, "stderr.log"))
+        self.assertFalse(argv.exists())
+
+    def test_report_write_failure_has_matching_exit(self):
+        report = self.dir / "report"
+        mock = self.write_mock("claude", f"""
+            os.mkdir({str(report)!r})
+            print(json.dumps({{"type": "result", "result": "report body"}}))
+        """)
+        proc, outdir = self.run_cli("claude", mock, "-o", str(report), prompt="go")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(self.read(outdir, "exit"), "2\n")
+        self.assertIn("无法写入报告", self.read(outdir, "stderr.log"))
+        self.assertIn("❌ 失败 (exit 2)", proc.stdout)
+
+    def test_prompt_file_cleaned_when_events_open_fails(self):
+        for backend, prompt in (("devin", "go"), ("kimi", "x" * 97_000)):
+            with self.subTest(backend=backend):
+                outdir = self.path("invalid-events")
+                (outdir / "events.jsonl").mkdir(parents=True)
+                proc, _ = self.run_cli(
+                    backend, self.dir / "unused-cli", stdin_text=prompt, outdir=outdir,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertEqual(self.read(outdir, "exit"), "2\n")
+                self.assertEqual(list(outdir.glob(".prompt.*")), [])
+
     def test_codex_transient_error_recovered(self):
         mock = self.write_mock(
             "codex",
@@ -919,13 +1120,32 @@ print(json.dumps({"type": "turn.completed"}))
         self.assertEqual(proc_env_block.returncode, 2)
         self.assertIn("disabled by AGENT_WORKER_ALLOWED", proc_env_block.stderr)
 
+    def test_explicit_missing_config_is_rejected(self):
+        missing = self.dir / "missing.json"
+        proc, outdir = self.run_cli(
+            "claude", self.dir / "unused-cli", prompt="go", env_extra={"AGENT_WORKER_CONFIG": str(missing)},
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(f"config file not found: {missing}", proc.stderr)
+        self.assertFalse(outdir.exists())
 
-class TimelineTests(unittest.TestCase):
+
+class RunnerUnitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         spec = importlib.util.spec_from_file_location("run_worker", SCRIPT)
         cls.worker = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.worker)
+
+    def test_line_sink_buffers_utf8_split_byte_by_byte(self):
+        lines = []
+        sink = self.worker.LineSink(lambda line: lines.append(line.decode("utf-8")))
+        for byte in "测".encode("utf-8"):
+            sink.feed(bytes([byte]))
+            self.assertEqual(lines, [])
+        sink.feed(b"\n")
+        sink.finish()
+        self.assertEqual(lines, ["测"])
 
     def test_elapsed_always_has_five_ascii_characters(self):
         for seconds, expected in (
@@ -962,6 +1182,20 @@ class TimelineTests(unittest.TestCase):
                 f"      │    {'测' * 26}...",
             ],
         )
+
+    def test_timeline_sub_wraps_and_caps_on_the_rail(self):
+        ui = self.worker.UI()
+        output = io.StringIO()
+        line = "测" * 29
+        with contextlib.redirect_stdout(output):
+            ui.note("开始")
+            ui.sub("✏️", line * 5)
+        self.assertEqual(output.getvalue().splitlines()[1:], [
+            f"      │ ✏️ {line}",
+            f"      │    {line}",
+            f"      │    {line}",
+            f"      │    {'测' * 26}...",
+        ])
 
     def test_groups_connect_and_consecutive_subs_are_deduplicated(self):
         ui = self.worker.UI()

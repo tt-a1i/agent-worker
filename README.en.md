@@ -52,13 +52,14 @@ Once installed, ask your host agent naturally (*"Have Codex fix the failing pars
       │ 🧪 运行测试/检查中...
 ──────────────────────────────────────────────────
 00:09 │ ✅ 完成 · 5 步 · 0.27 credits
+      │    报告: /tmp/worker.qoder.A1b2C3/out.md
 ```
 
 ## Features
 
 - **Unified entrypoint**: `scripts/run_worker.py <backend> ...` with shared flags and output conventions across all five backends.
 - **Live progress**: raw streaming events are translated into `💬` commentary, `✏️` file edits, `🧪` test cues, `🤝` subagents, and 40-second heartbeats instead of noisy raw logs.
-- **Clean context**: on exit 0 read only `out.md`; raw events, stderr, session ID, and exit code are persisted separately for debugging.
+- **Clean context**. On exit 0, read only the report path printed in the summary. The runner saves raw events, stderr, the session ID, and the exit code separately for debugging.
 - **Session reuse**: `--resume` continues a session and `--fork` branches one (Devin does not support fork; Kimi resolves the forked session ID automatically).
 - **Isolated runtime (partial)**: `codex`/`claude`/`qoder` skip user-global MCP/plugin configuration by default (auth is preserved); add `--include-user-config` to restore it. `kimi`/`devin` have no such isolation.
 - **Process-group lifecycle**: SIGINT/SIGTERM/SIGHUP are forwarded to the whole process group; a cancel that outlives a 5-second grace (or a second signal) escalates to SIGKILL, and surviving descendants plus inherited pipes are reclaimed even after the group leader exits.
@@ -84,7 +85,7 @@ git clone https://github.com/tt-a1i/agent-worker.git
 d=$(mktemp -d /tmp/worker.codex.XXXXXX)
 python3 agent-worker/scripts/run_worker.py codex -C /path/to/repo -d "$d" <<'EOF'
 Fix the failing case in tests/test_parser.py: reproduce first, then make the minimal fix and run only the affected tests.
-In out.md, report the exact verification commands you ran and anything left unverified.
+In your final response, report the exact verification commands you ran, any non-obvious toolchain or environment paths, anything left unverified, and any out-of-scope edits. The runner saves your final response automatically. Do not create report files in the repo.
 EOF
 cat "$d/out.md"
 ```
@@ -106,12 +107,14 @@ Codex keeps `service_tier=default`; do not use `fast`/`ultrafast` unless the use
 | Backend | `--ephemeral` | `--fork` | Config isolation (default) | Native diff review |
 | --- | --- | --- | --- | --- |
 | `codex` | ✅ | ✅ | ✅ `--ignore-user-config` | ✅ `--base`/`--commit`/`--uncommitted` |
-| `claude` | ✅ (never with `--resume`/`--fork`) | ✅ | ✅ project-level config/MCP only | ❌ |
-| `qoder` | ✅ (same) | ✅ | ✅ project-level config/MCP only | ❌ |
+| `claude` | ✅ (never with `--resume`/`--fork`) | ✅ | ✅ project/local settings (MCP disabled) | ❌ |
+| `qoder` | ✅ (same) | ✅ | ✅ project/local settings (MCP disabled) | ❌ |
 | `kimi` | ❌ | ✅ resolves the new session ID | ❌ user config retained | ❌ |
 | `devin` | ❌ | ❌ | ❌ user config retained | ❌ |
 
-`--ephemeral` exists only where the backend can truly disable persistence, and it is mutually exclusive with `--resume`/`--fork`; `kimi`/`devin` reject it up front. `sid` is written only after a new (or forked) session ID is confirmed. Devin's `events.jsonl` is derived from its SQLite session database (`sessions.db`) and may be empty when the DB is unreadable.
+`--ephemeral` exists only where the backend can truly disable persistence, and it is mutually exclusive with `--resume`/`--fork`; `kimi`/`devin` reject it up front. `sid` is written only after a new (or forked) session ID is confirmed. Devin reads events from `sessions.db`. For fresh runs, it can show live database events when the session identifies the prompt file. Otherwise it checks for a single matching session at the end. If attribution is ambiguous, the report still comes from Devin's stdout.
+
+Claude and Qoder use `--setting-sources project,local --strict-mcp-config` to keep project and local settings while disabling unconfigured MCP servers.
 
 ## Common commands
 
@@ -128,11 +131,13 @@ EOF
 
 ```bash
 # Codex native diff review
+d2=$(mktemp -d /tmp/worker.review.XXXXXX)
 python3 scripts/run_worker.py codex -C "$repo" -d "$d2" -o "$d2/review.md" --review --base main
 
 # Other backends: --review with a read-only prompt
+d3=$(mktemp -d /tmp/worker.review.XXXXXX)
 python3 scripts/run_worker.py qoder -C "$repo" -d "$d3" -o "$d3/review.md" --review <<'EOF'
-Read-only review (do not modify files): inspect `git diff main...HEAD` and report real bugs, regressions, and missing edge cases.
+Inspect `git diff main...HEAD` and report real bugs, regressions, and missing edge cases. Do not create or modify files, snapshots, or other artifacts.
 EOF
 ```
 
@@ -160,7 +165,7 @@ EOF
 | `stderr.log` | Backend stderr (inspect on failure) |
 | `sid` | New session ID (written only after confirmation; for `--resume`/`--fork`) |
 | `exit` | Final exit code |
-| `.prompt.*` | Oversized Kimi / Devin prompt files (mode `0600`, removed when the run ends) |
+| `.prompt.*` | Temporary files for Devin prompts and oversized Kimi prompts (mode `0600`, removed when the run ends) |
 
 ## Environment variables and local config
 
@@ -168,7 +173,7 @@ EOF
 | --- | --- |
 | `~/.config/agent-worker/config.json` | Optional local config, e.g. `{"allowed_backends": ["codex", "qoder"]}` to restrict enabled backends on a machine |
 | `AGENT_WORKER_ALLOWED` | Comma-separated backend allowlist (e.g. `codex,qoder`, or `*` for all); overrides the config file |
-| `AGENT_WORKER_CONFIG` | Override the config file path (set to empty string `""` to skip loading the default config) |
+| `AGENT_WORKER_CONFIG` | Override the config file path. A missing explicit path is an error. Set to `""` to disable loading. |
 | `AGENT_WORKER_<BACKEND>_BIN` | Override the backend executable path, e.g. `AGENT_WORKER_CODEX_BIN` |
 | `AGENT_WORKER_DEVIN_DB` | Override the Devin session database path (default `~/.local/share/devin/cli/sessions.db`) |
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import codecs
+import errno
 import json
 import os
 import pathlib
@@ -11,6 +13,7 @@ import selectors
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -172,14 +175,15 @@ def clean_progress_text(text: str) -> str:
     return "\n".join(lines)
 
 
-def format_timeline_block(icon: str, text: str, ts: str) -> str:
+def format_timeline_block(icon: str, text: str, ts: str | None = None) -> str:
     lines = wrap_display_lines(clean_progress_text(text), BODY_WIDTH) or [""]
     if len(lines) > 4:
         lines = lines[:3] + [lines[3][: max(1, len(lines[3]) - 3)].rstrip() + "..."]
 
     icon_prefix = f"{icon} "
     indent = " " * disp_width(icon_prefix)
-    rendered = [f"{ts} │ {icon_prefix}{lines[0]}"]
+    rail = TIMELINE_RAIL if ts is None else f"{ts} │"
+    rendered = [f"{rail} {icon_prefix}{lines[0]}"]
     rendered.extend(f"{TIMELINE_RAIL} {indent}{line}" for line in lines[1:])
     return "\n".join(rendered)
 
@@ -276,7 +280,7 @@ class UI:
         if self.last_sub == (icon, clean_msg):
             return
         if self.has_body:
-            self.last_print = safe_print(f"{TIMELINE_RAIL} {icon} {clean_msg}")
+            self.last_print = safe_print(format_timeline_block(icon, clean_msg))
         else:
             self.status(icon, clean_msg)
         self.last_sub = (icon, clean_msg)
@@ -397,10 +401,24 @@ def resolve_model_effort(args, is_review: bool) -> tuple[str, str]:
     return args.model or "", ""
 
 
-def write_report(ctx: Ctx, body: str, rc: int, ui: UI) -> None:
-    ctx.out_file.write_text(body or "", encoding="utf-8")
+def log_error(ctx: Ctx, msg: str, mode: str = "a") -> None:
+    try:
+        with ctx.stderr_file.open(mode, encoding="utf-8") as log:
+            log.write(msg + "\n")
+    except OSError as exc:
+        print(f"❌ 无法写入日志 {ctx.stderr_file}: {exc}", file=sys.stderr, flush=True)
+    print(msg, file=sys.stderr, flush=True)
+
+
+def write_report(ctx: Ctx, body: str, rc: int, ui: UI) -> int:
+    try:
+        ctx.out_file.write_text(body or "", encoding="utf-8")
+    except OSError as exc:
+        log_error(ctx, f"❌ 无法写入报告 {ctx.out_file}: {exc}")
+        return rc or 2
     if not body and rc == 0:
         ui.status("⚠️", "报告内容为空")
+    return rc
 
 
 def _killpg(pgid: int, sig: int) -> None:
@@ -462,9 +480,10 @@ def execute(ctx: Ctx, cmd, *, cwd=None, feed_bytes=None, sink, tick=None, heartb
             except (ValueError, OSError):
                 pass
 
-        sel = selectors.DefaultSelector()
+        sel = None
         eof = {"done": False}
         try:
+            sel = selectors.DefaultSelector()
             if feed_bytes is not None:
                 def feed_stdin() -> None:
                     assert proc.stdin is not None
@@ -547,47 +566,44 @@ def execute(ctx: Ctx, cmd, *, cwd=None, feed_bytes=None, sink, tick=None, heartb
             rc = 124 if timed_out["hit"] else wrc
         finally:
             try:
-                sink.finish()
-            except Exception:
-                pass
-            sel.close()
-            for sig, old in old_handlers.items():
                 try:
-                    signal.signal(sig, old)
-                except (ValueError, OSError):
+                    sink.finish()
+                except Exception:
                     pass
-            # Always reclaim the process group we created: the leader may already be gone
-            # while a grandchild still holds the pipe or keeps working.
-            _killpg(pgid, signal.SIGTERM)
-            grace_until = (
-                cancel["deadline"]
-                if (cancel["deadline"] is not None and not cancel["killed"])
-                else (time.monotonic() + 1.0)
-            )
-            while not cancel["killed"] and time.monotonic() < grace_until:
+                if sel is not None:
+                    sel.close()
+            finally:
                 try:
-                    os.kill(-pgid, 0)
-                except ProcessLookupError:
-                    break
-                except PermissionError:
-                    pass
-                time.sleep(0.05)
-            _killpg(pgid, signal.SIGKILL)
-            try:
-                proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                pass
-            if proc.stdout is not None:
-                try:
-                    proc.stdout.close()
-                except OSError:
-                    pass
+                    # The leader may already be gone while a descendant is still running.
+                    _killpg(pgid, signal.SIGTERM)
+                    grace_until = time.monotonic() + 1.0
+                    while not cancel["killed"] and time.monotonic() < (cancel["deadline"] or grace_until):
+                        try:
+                            os.killpg(pgid, 0)
+                        except ProcessLookupError:
+                            break
+                        except PermissionError:
+                            pass
+                        time.sleep(0.05)
+                    _killpg(pgid, signal.SIGKILL)
+                    proc.wait()
+                finally:
+                    for sig, old in old_handlers.items():
+                        try:
+                            signal.signal(sig, old)
+                        except (ValueError, OSError):
+                            pass
+                    if proc.stdout is not None:
+                        try:
+                            proc.stdout.close()
+                        except OSError:
+                            pass
 
     if rc < 0:
         rc = 128 + abs(rc)
     if tick is not None:
         tick()
-    return rc
+    return 128 + ctx.cancel_sig if ctx.canceled else rc
 
 
 def run_codex(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
@@ -725,13 +741,19 @@ def run_codex(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
             rc = 1
         if stage.exists() and stage.stat().st_size > 0:
             try:
-                os.replace(str(stage), str(ctx.out_file))
-            except OSError:
-                shutil.move(str(stage), str(ctx.out_file))
+                try:
+                    stage.replace(ctx.out_file)
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV:
+                        raise
+                    shutil.copy2(stage, ctx.out_file)
+            except OSError as exc:
+                log_error(ctx, f"❌ 无法写入报告 {ctx.out_file}: {exc}")
+                rc = rc or 2
         elif st["last_agent_text"]:
-            write_report(ctx, st["last_agent_text"], rc, ui)
+            rc = write_report(ctx, st["last_agent_text"], rc, ui)
         elif rc == 0:
-            write_report(ctx, "", rc, ui)
+            rc = write_report(ctx, "", rc, ui)
     finally:
         stage.unlink(missing_ok=True)
     return rc, st["steps"], ""
@@ -756,24 +778,21 @@ def run_claude_like(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
     if not a.include_user_config:
         cmd.extend(["--strict-mcp-config", "--setting-sources", "project,local"])
 
-    sid = ""
+    fallback_sid = ""
     if a.resume is not None:
-        sid = a.resume
-        cmd.extend(["-r", sid])
-        ctx.sid_file.write_text(sid + "\n", encoding="utf-8")
+        fallback_sid = a.resume
+        cmd.extend(["-r", a.resume])
     elif a.fork is not None:
-        # Publish the parent only after the backend reports the actual new session ID.
-        sid = a.fork
-        cmd.extend(["-r", sid, "--fork-session"])
+        cmd.extend(["-r", a.fork, "--fork-session"])
     elif a.ephemeral:
         cmd.append("--no-session-persistence")
     else:
-        sid = str(uuid.uuid4()).lower()
-        cmd.extend(["--session-id", sid])
-        ctx.sid_file.write_text(sid + "\n", encoding="utf-8")
+        new_sid = str(uuid.uuid4())
+        cmd.extend(["--session-id", new_sid])
+        fallback_sid = new_sid
 
     st = {
-        "sid": sid, "steps": 0, "seen_texts": set(), "buffered_texts": {},
+        "sid": "", "steps": 0, "seen_texts": set(), "buffered_texts": {},
         "flushed_mids": set(), "seen_tools": set(), "last_assistant_text": "",
         "final_result_text": "", "total_cost_usd": None, "total_credits": None,
         "last_files_sig": "", "last_test_announce": -1e9, "is_error": False,
@@ -791,7 +810,7 @@ def run_claude_like(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
     def handle_event(ev: dict) -> None:
         etype = ev.get("type", "")
         ev_sid = ev.get("session_id")
-        if ev_sid and ev_sid != st["sid"]:
+        if ev_sid and ev_sid != a.fork and ev_sid != st["sid"]:
             st["sid"] = ev_sid
             if not a.ephemeral:
                 ctx.sid_file.write_text(ev_sid + "\n", encoding="utf-8")
@@ -878,8 +897,10 @@ def run_claude_like(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
 
     if rc == 0 and st["is_error"]:
         rc = 1
+    if rc == 0 and not a.ephemeral and fallback_sid and not st["sid"]:
+        ctx.sid_file.write_text(fallback_sid + "\n", encoding="utf-8")
 
-    write_report(ctx, st["final_result_text"] or st["last_assistant_text"], rc, ui)
+    rc = write_report(ctx, st["final_result_text"] or st["last_assistant_text"], rc, ui)
 
     if backend == "qoder" and ctx.stderr_file.exists():
         for eline in ctx.stderr_file.read_text(errors="ignore").splitlines():
@@ -935,7 +956,6 @@ def run_kimi(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
     prompt_file = None
     if len(full_prompt.encode("utf-8")) > KIMI_PROMPT_FILE_THRESHOLD:
         prompt_file = ctx.out_dir / f".prompt.{os.getpid()}.md"
-        write_private_text(prompt_file, full_prompt)
         arg_prompt = f"Read all instructions from {prompt_file} and execute them."
     else:
         arg_prompt = full_prompt
@@ -977,6 +997,8 @@ def run_kimi(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
             st["last_assistant_text"] = txt
 
     try:
+        if prompt_file is not None:
+            write_private_text(prompt_file, full_prompt)
         with ctx.events_file.open("w", encoding="utf-8") as ev_out:
             rc = execute(
                 ctx,
@@ -992,7 +1014,7 @@ def run_kimi(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
 
     if rc == 0 and st["is_error"]:
         rc = 1
-    write_report(ctx, st["last_assistant_text"], rc, ui)
+    rc = write_report(ctx, st["last_assistant_text"], rc, ui)
     return rc, st["steps"], ""
 
 
@@ -1010,7 +1032,9 @@ def run_devin(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
     a = ctx.a
     bin_path = resolve_bin("devin")
     prompt_file = ctx.out_dir / f".prompt.{os.getpid()}.txt"
-    write_private_text(prompt_file, f"{ctx.prompt.rstrip()}\n\n[注：{PROGRESS_HINT}]\n")
+    full_prompt = f"{ctx.prompt.rstrip()}\n\n[注：{PROGRESS_HINT}]\n"
+    prompt_refs = {str(prompt_file), f"@{prompt_file}"}
+    prompt_texts = {ctx.prompt.strip(), full_prompt.strip(), *prompt_refs}
 
     cmd = [bin_path, "--permission-mode", "dangerous", "--respect-workspace-trust", "false"]
     if ctx.model:
@@ -1025,107 +1049,127 @@ def run_devin(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
         or os.path.expanduser("~/.local/share/devin/cli/sessions.db")
     )
     real_repo = os.path.realpath(ctx.repo)
-    launch_epoch = time.time() - 1.0
     st = {
         "sid": a.resume or "", "steps": 0, "nodes_seen": set(), "tool_seen": set(),
-        "sid_written": False, "sid_ambiguous": False, "db_warned": False, "last_poll": -1e9,
+        "sid_written": False, "sid_locked": a.resume is not None,
+        "ambiguous": False, "db_warned": False, "last_poll": -1e9,
     }
-    db_state = {"pre_sids": set(), "baseline_nodes": set()}
-
-    if db_path.exists():
-        try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
-        except sqlite3.Error:
-            conn = None
-        if conn is not None:
-            try:
-                db_state["pre_sids"] = {str(r[0]) for r in conn.execute("SELECT id FROM sessions")}
-                if a.resume is not None:
-                    full = _resolve_devin_sid(conn, a.resume)
-                    if full:
-                        st["sid"] = full
-                        db_state["baseline_nodes"] = {
-                            str(r[0])
-                            for r in conn.execute(
-                                "SELECT node_id FROM message_nodes WHERE session_id = ?", (full,)
-                            )
-                        }
-            except sqlite3.Error:
-                pass
-            finally:
-                conn.close()
-
-    if st["sid"]:
-        ctx.sid_file.write_text(st["sid"] + "\n", encoding="utf-8")
-        st["sid_written"] = True
+    pre_sids = set()
+    pending = {}
 
     def warn_db_once(exc: Exception) -> None:
         if not st["db_warned"]:
             st["db_warned"] = True
             ui.status("⚠️", f"Devin 会话数据库读取异常: {str(exc)[:160]}")
 
-    def poll_once(conn: sqlite3.Connection, ev_out) -> None:
-        if st["sid_ambiguous"]:
-            return
-        if a.resume is None:
+    def _matches_prompt_ref(conn: sqlite3.Connection, cand_sid: str) -> bool:
+        for (chat,) in conn.execute(
+            "SELECT chat_message FROM message_nodes WHERE session_id = ?", (cand_sid,)
+        ):
+            raw = chat if isinstance(chat, str) else json.dumps(chat, ensure_ascii=False)
+            try:
+                cm = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(cm, dict) and cm.get("role") == "user":
+                if content_text(cm.get("content")).strip() in prompt_refs:
+                    return True
+        return False
+
+    def poll_once(conn: sqlite3.Connection, ev_out, final: bool) -> None:
+        conn.execute("BEGIN")
+        if a.resume is None and not st["sid_locked"]:
             rows = conn.execute(
                 "SELECT id FROM sessions WHERE working_directory = ? AND last_activity_at >= ?",
                 (real_repo, launch_epoch),
-            ).fetchall()
-            candidates = [str(r[0]) for r in rows if str(r[0]) not in db_state["pre_sids"]]
-            if len(candidates) > 1:
-                st["sid"] = ""
-                st["sid_ambiguous"] = True
-                ctx.sid_file.unlink(missing_ok=True)
-                ui.status("⚠️", "无法确定本次 Devin 会话 ID（多个新会话），仅保留 stdout 报告")
+            )
+            candidates = [str(r[0]) for r in rows if str(r[0]) not in pre_sids]
+            if not candidates:
                 return
-            if len(candidates) == 1 and not st["sid"]:
+            if len(candidates) > 1 or (st["sid"] and st["sid"] != candidates[0]):
+                matched = [c for c in candidates if _matches_prompt_ref(conn, c)]
+                if len(matched) == 1:
+                    if st["sid"] and st["sid"] != matched[0]:
+                        pending.clear()
+                    st["sid"] = matched[0]
+                    st["sid_locked"] = True
+                else:
+                    st["ambiguous"] = True
+                    pending.clear()
+                    ctx.sid_file.unlink(missing_ok=True)
+                    ui.status("⚠️", "无法确定本次 Devin 会话 ID（多个新会话），仅保留 stdout 报告")
+                    return
+            else:
                 st["sid"] = candidates[0]
-                if not st["sid_written"]:
-                    ctx.sid_file.write_text(st["sid"] + "\n", encoding="utf-8")
-                    st["sid_written"] = True
-        if not st["sid"]:
-            return
 
-        row = conn.execute("SELECT main_chain_id FROM sessions WHERE id = ?", (st["sid"],)).fetchone()
+        sid = st["sid"]
+        row = conn.execute("SELECT main_chain_id FROM sessions WHERE id = ?", (sid,)).fetchone()
         main_id = row[0] if row else None
         rows = conn.execute(
-            "SELECT node_id, parent_node_id, chat_message FROM message_nodes WHERE session_id = ?",
-            (st["sid"],),
-        ).fetchall()
-        nodes = {}
-        rowid_order = []
-        for node_id, parent_id, chat in rows:
-            if node_id in (None, ""):
-                continue
-            key = str(node_id)
-            nodes[key] = (str(parent_id) if parent_id not in (None, "") else None, chat)
-            rowid_order.append(key)
+            "SELECT node_id, parent_node_id FROM message_nodes WHERE session_id = ?", (sid,)
+        )
+        parents = {
+            str(key): str(parent) if parent is not None else ""
+            for key, parent in rows if key not in (None, "")
+        }
 
         if main_id not in (None, ""):
             chain = []
             seen = set()
             cur = str(main_id)
-            while cur and cur in nodes and cur not in seen:
+            while cur in parents and cur not in seen:
                 seen.add(cur)
                 chain.append(cur)
-                cur = nodes[cur][0]
+                cur = parents[cur]
             chain.reverse()
         else:
-            chain = rowid_order
+            chain = list(parents)
 
-        for key in chain:
-            if key in db_state["baseline_nodes"] or key in st["nodes_seen"]:
-                continue
-            chat = nodes[key][1]
-            raw = chat if isinstance(chat, str) else json.dumps(chat, ensure_ascii=False)
+        if final and not st["sid_written"]:
+            # A buffered message may have been updated before Devin exited.
+            pending.clear()
+        unseen = [key for key in chain if key not in st["nodes_seen"]]
+        missing = [key for key in unseen if key not in pending]
+        # Keep each query under SQLite's historical limit of 999 parameters.
+        for start in range(0, len(missing), 998):
+            batch = missing[start:start + 998]
+            params = ",".join("?" for _ in batch)
+            rows = conn.execute(
+                f"SELECT node_id, chat_message FROM message_nodes WHERE session_id = ? AND node_id IN ({params})",
+                (sid, *batch),
+            )
+            for key, chat in rows:
+                raw = chat if isinstance(chat, str) else json.dumps(chat, ensure_ascii=False)
+                try:
+                    cm = json.loads(raw)
+                except json.JSONDecodeError:
+                    cm = None
+                pending[str(key)] = (raw, cm if isinstance(cm, dict) else {})
+        conn.rollback()
+
+        if not st["sid_written"]:
+            user_text = ""
+            for key in unseen:
+                _, cm = pending[key]
+                if cm.get("role") == "user":
+                    user_text = content_text(cm.get("content")).strip()
+                    break
+            if not user_text or user_text not in prompt_texts:
+                return
+            if user_text in prompt_refs:
+                st["sid_locked"] = True
+            # A plain prompt can be shared by concurrent runs. Hold its events
+            # until the final poll unless the user message names our prompt file.
+            if not final and not st["sid_locked"]:
+                return
+            ctx.sid_file.write_text(sid + "\n", encoding="utf-8")
+            st["sid_written"] = True
+
+        for key in unseen:
+            raw, cm = pending.pop(key)
             ev_out.write(raw.rstrip("\n") + "\n")
             ev_out.flush()
-            try:
-                cm = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                cm = None
-            if isinstance(cm, dict) and cm.get("role") == "assistant":
+            if cm.get("role") == "assistant":
                 tools = cm.get("tool_calls") or []
                 if tools:
                     txt = content_text(cm.get("content"))
@@ -1136,11 +1180,11 @@ def run_devin(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
                     handle_tools(tools, ctx, ui, st, st["tool_seen"])
             st["nodes_seen"].add(key)
 
-    def poll_db(force: bool = False) -> None:
-        if not db_path.exists():
+    def poll_db(final: bool = False) -> None:
+        if st["ambiguous"] or not db_ready or not db_path.exists():
             return
         now = time.monotonic()
-        if not force and (now - st["last_poll"]) < DEVIN_POLL_INTERVAL:
+        if not final and (now - st["last_poll"]) < DEVIN_POLL_INTERVAL:
             return
         st["last_poll"] = now
         try:
@@ -1150,7 +1194,7 @@ def run_devin(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
                 warn_db_once(exc)
             return
         try:
-            poll_once(conn, ev_out)
+            poll_once(conn, ev_out, final)
         except sqlite3.OperationalError as exc:
             text = str(exc)
             if "locked" not in text and "busy" not in text:
@@ -1160,25 +1204,51 @@ def run_devin(ctx: Ctx, ui: UI) -> tuple[int, int, str]:
         finally:
             conn.close()
 
+    db_ready = True
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.5)
+            try:
+                conn.execute("BEGIN")
+                pre_sids = {str(r[0]) for r in conn.execute("SELECT id FROM sessions")}
+                if a.resume is not None:
+                    st["sid"] = _resolve_devin_sid(conn, a.resume) or a.resume
+                    st["nodes_seen"] = {
+                        str(r[0]) for r in conn.execute(
+                            "SELECT node_id FROM message_nodes WHERE session_id = ?", (st["sid"],)
+                        )
+                    }
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            db_ready = False
+            warn_db_once(exc)
+
+    if a.resume is not None:
+        ctx.sid_file.write_text(st["sid"] + "\n", encoding="utf-8")
+        st["sid_written"] = True
+
     sink = RawSink()
-    ev_out = ctx.events_file.open("w", encoding="utf-8")
     try:
-        rc = execute(
-            ctx,
-            cmd,
-            cwd=ctx.repo,
-            sink=sink,
-            tick=poll_db,
-            heartbeat=lambda: ui.heartbeat(a.heartbeat, st["steps"]),
-            select_timeout=1.0,
-        )
-        poll_db(force=True)
+        write_private_text(prompt_file, full_prompt)
+        with ctx.events_file.open("w", encoding="utf-8") as ev_out:
+            launch_epoch = time.time() - 1.0
+            rc = execute(
+                ctx,
+                cmd,
+                cwd=ctx.repo,
+                sink=sink,
+                tick=poll_db,
+                heartbeat=lambda: ui.heartbeat(a.heartbeat, st["steps"]),
+                select_timeout=1.0,
+            )
+            if not ctx.missing_bin:
+                poll_db(final=True)
     finally:
-        ev_out.close()
         prompt_file.unlink(missing_ok=True)
 
     raw_text = bytes(sink.data).decode("utf-8", errors="replace")
-    write_report(ctx, raw_text, rc, ui)
+    rc = write_report(ctx, raw_text, rc, ui)
     return rc, st["steps"], ""
 
 
@@ -1211,16 +1281,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def read_stdin_nonblocking() -> str:
-    sel_in = selectors.DefaultSelector()
+    """Return non-whitespace prompt text if any is immediately available."""
+    decode = codecs.getincrementaldecoder("utf-8")(errors="replace").decode
     try:
-        sel_in.register(sys.stdin, selectors.EVENT_READ)
-        if sel_in.select(timeout=0.0):
-            return os.read(sys.stdin.fileno(), 4096).decode("utf-8", errors="replace")
+        fd = sys.stdin.fileno()
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        with selectors.DefaultSelector() as sel_in:
+            if not regular:
+                sel_in.register(fd, selectors.EVENT_READ)
+            while regular or sel_in.select(timeout=0.0):
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                text = decode(chunk)
+                if text.strip():
+                    return text
     except OSError:
         pass
-    finally:
-        sel_in.close()
-    return ""
+    return decode(b"", final=True)
 
 
 def check_allowed_backend(ap: argparse.ArgumentParser, backend: str) -> None:
@@ -1244,6 +1322,8 @@ def check_allowed_backend(ap: argparse.ArgumentParser, backend: str) -> None:
         return
     cfg_path = pathlib.Path(cfg_raw or DEFAULT_CONFIG_PATH).expanduser()
     if not cfg_path.exists():
+        if cfg_raw is not None:
+            ap.error(f"config file not found: {cfg_path}")
         return
     try:
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -1313,14 +1393,17 @@ def main() -> int:
 
     if not os.path.isdir(ctx.repo):
         msg = f"❌ 目标目录不存在或不是目录: {ctx.repo}"
-        ctx.stderr_file.write_text(msg + "\n", encoding="utf-8")
-        print(msg, file=sys.stderr, flush=True)
-        ctx.exit_file.write_text("2\n", encoding="utf-8")
-        return 2
-    if ctx.out_file.exists() and ctx.out_file.is_dir():
-        msg = f"❌ 输出报告路径不能是目录: {ctx.out_file}"
-        ctx.stderr_file.write_text(msg + "\n", encoding="utf-8")
-        print(msg, file=sys.stderr, flush=True)
+    else:
+        msg = ""
+        try:
+            if ctx.out_file.is_dir():
+                msg = f"❌ 输出报告路径不能是目录: {ctx.out_file}"
+            else:
+                ctx.out_file.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            msg = f"❌ 无法准备输出报告路径 {ctx.out_file}: {exc}"
+    if msg:
+        log_error(ctx, msg, mode="w")
         ctx.exit_file.write_text("2\n", encoding="utf-8")
         return 2
 
@@ -1360,18 +1443,21 @@ def main() -> int:
             rc, steps, cost = run_kimi(ctx, ui)
         else:
             rc, steps, cost = run_devin(ctx, ui)
+    except OSError as exc:
+        log_error(ctx, f"❌ 运行失败: {exc}")
     finally:
+        if ctx.canceled:
+            rc = 128 + ctx.cancel_sig
         ctx.exit_file.write_text(f"{rc}\n", encoding="utf-8")
-
-    if ctx.missing_bin:
-        return rc
 
     if ui.has_body:
         safe_print(RULE_LINE)
     if rc == 0:
         safe_print(format_timeline_block("✅", f"完成 · {steps} 步{cost}", ui.elapsed()))
+        safe_print(f"{TIMELINE_RAIL}    报告: {ctx.out_file}")
     else:
-        safe_print(format_timeline_block("❌", f"失败 (exit {rc}) · {steps} 步", ui.elapsed()))
+        state = "已取消" if ctx.canceled else "失败"
+        safe_print(format_timeline_block("❌", f"{state} (exit {rc}) · {steps} 步", ui.elapsed()))
         safe_print(f"{TIMELINE_RAIL}    日志: {ctx.stderr_file}")
     return rc
 
